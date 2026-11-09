@@ -174,6 +174,8 @@ Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 
 ## Licencje
 
+BibiCord jest udostępniany na licencji MIT (`LICENSE`).
+
 Font Inter: SIL Open Font License 1.1 (`assets/fonts/Inter-LICENSE.txt`).
 Ikony Phosphor: MIT.
 
