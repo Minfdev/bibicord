@@ -2,7 +2,7 @@
 //! `BIBICORD_DEMO_NAME`, `BIBICORD_DEMO_ROOM`, `BIBICORD_DEMO_CREATE=<file>`
 //! (writes invite), `BIBICORD_DEMO_JOIN=<file>` (reads invite),
 //! `BIBICORD_DEMO_CHAT=a|b`, `BIBICORD_DEMO_STREAM=1`, `BIBICORD_DEMO_WATCH=1`,
-//! `BIBICORD_DEMO_VOICE=1`, `BIBICORD_DEMO_MUTE=1`, `BIBICORD_DEMO_VIEW=voice`,
+//! `BIBICORD_DEMO_VOICE=1`, `BIBICORD_DEMO_CAMERA=1`, `BIBICORD_DEMO_MUTE=1`, `BIBICORD_DEMO_VIEW=voice`,
 //! `BIBICORD_DEMO_STAGE_CHAT=1`, `BIBICORD_DEMO_DIALOG=golive|settings|invite|update|share|profile`,
 //! `BIBICORD_DEMO_AVATAR=<image>` (not saved),
 //! `BIBICORD_DEMO_SHOT=<png>` + `BIBICORD_DEMO_SHOT_AFTER=<secs>`.
@@ -20,6 +20,7 @@ pub struct Demo {
     pub stream: bool,
     pub watch: bool,
     pub voice: bool,
+    pub camera: bool,
     pub mute: bool,
     pub view_voice: bool,
     pub stage_chat: bool,
@@ -30,6 +31,7 @@ pub struct Demo {
     pub ticket_written: bool,
     pub chat_sent: bool,
     pub stream_started: bool,
+    pub camera_started: bool,
     pub setup_done: bool,
     pub dialog_opened: bool,
 }
@@ -53,6 +55,7 @@ impl Demo {
             stream: var("BIBICORD_DEMO_STREAM").is_some(),
             watch: var("BIBICORD_DEMO_WATCH").is_some(),
             voice: var("BIBICORD_DEMO_VOICE").is_some(),
+            camera: var("BIBICORD_DEMO_CAMERA").is_some(),
             mute: var("BIBICORD_DEMO_MUTE").is_some(),
             view_voice: var("BIBICORD_DEMO_VIEW").as_deref() == Some("voice"),
             stage_chat: var("BIBICORD_DEMO_STAGE_CHAT").is_some(),
@@ -63,6 +66,7 @@ impl Demo {
             ticket_written: false,
             chat_sent: false,
             stream_started: false,
+            camera_started: false,
             setup_done: false,
             dialog_opened: false,
         })

@@ -18,6 +18,7 @@ const GAP: f32 = 8.0;
 impl App {
     pub(crate) fn stage(&mut self, ui: &mut egui::Ui) {
         self.pull_frame(ui.ctx());
+        self.pull_cameras(ui.ctx());
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
 
@@ -135,8 +136,18 @@ impl App {
         p.rect_filled(rect, r::CARD, mix(bg, m.color, hover * 0.08));
         let avatar_r = (rect.height() * 0.2).clamp(16.0, 48.0);
         let speak = ui.ctx().animate_bool_with_time(id.with("speak"), m.speaking, if m.speaking { 0.08 } else { 0.3 });
-        Avatar { name: &m.name, color: m.color, image: m.avatar.as_ref(), radius: avatar_r, speaking: speak, status: None }
-            .paint(ui, rect.center() - Vec2::new(0.0, if rect.height() > 140.0 { 8.0 } else { 6.0 }));
+        if let Some((tex, size)) = &m.video {
+            // Fill the tile (crop the overflow); our own preview is mirrored.
+            let (sx, sy) = (rect.width() / size.x, rect.height() / size.y);
+            let (cw, ch) = if sx > sy { (1.0, sy / sx) } else { (sx / sy, 1.0) };
+            let (x0, x1) = ((1.0 - cw) / 2.0, (1.0 + cw) / 2.0);
+            let (x0, x1) = if m.id.is_none() { (x1, x0) } else { (x0, x1) };
+            let uv = Rect::from_min_max(Pos2::new(x0, (1.0 - ch) / 2.0), Pos2::new(x1, (1.0 + ch) / 2.0));
+            egui::Image::new((tex.id(), rect.size())).uv(uv).corner_radius(r::CARD).paint_at(ui, rect);
+        } else {
+            Avatar { name: &m.name, color: m.color, image: m.avatar.as_ref(), radius: avatar_r, speaking: speak, status: None }
+                .paint(ui, rect.center() - Vec2::new(0.0, if rect.height() > 140.0 { 8.0 } else { 6.0 }));
+        }
         if speak > 0.0 {
             ui.painter().rect_stroke(
                 rect,
@@ -288,7 +299,7 @@ impl App {
             }
             return;
         }
-        let n = 4.0;
+        let n = 5.0;
         let total = n * 48.0 + (n - 1.0) * 12.0;
         let r = Rect::from_center_size(center, Vec2::new(total, 48.0));
         let mut act = 0;
@@ -313,6 +324,14 @@ impl App {
                 if w::round_button(ui, i, t, k).clicked() {
                     act = 2;
                 }
+                let (i, k, t) = if self.camera_on {
+                    (ic::VIDEO_CAMERA, RoundKind::On, "Wyłącz kamerę")
+                } else {
+                    (ic::VIDEO_CAMERA_SLASH, RoundKind::Normal, "Włącz kamerę")
+                };
+                if w::round_button(ui, i, t, k).clicked() {
+                    act = 5;
+                }
                 let (k, t) = if self.my_stream.is_some() {
                     (RoundKind::On, "Zakończ stream")
                 } else {
@@ -332,6 +351,7 @@ impl App {
             3 if self.my_stream.is_some() => self.node.stop_stream(),
             3 if crate::ffmpeg::path().is_some() && !self.stream_starting => self.open_go_live(),
             4 => self.node.leave_voice(),
+            5 if crate::ffmpeg::path().is_some() => self.toggle_camera(),
             _ => {}
         }
     }

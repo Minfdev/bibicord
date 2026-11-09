@@ -3,7 +3,7 @@
 //! are only used for the initial rendezvous or when a direct path is
 //! impossible. There is no server of our own.
 
-use crate::proto::{self, ALPN, DGRAM_VOICE, Msg, StreamInfo, TAG_CONTROL, TAG_WATCH};
+use crate::proto::{self, ALPN, DGRAM_VOICE, Msg, StreamInfo, TAG_CAMERA, TAG_CONTROL, TAG_WATCH};
 use crate::video::{self, decode::FrameSlot};
 use crate::voice::Voice;
 use anyhow::{Context, Result, bail};
@@ -26,11 +26,13 @@ pub enum Event {
     PeerProfile { id: EndpointId, name: String, avatar: Option<Vec<u8>> },
     PeerLeft { id: EndpointId },
     PeerStream { id: EndpointId, info: Option<StreamInfo> },
+    PeerCamera { id: EndpointId, on: bool },
     PeerVoice { id: EndpointId, on: bool },
     PeerMute { id: EndpointId, muted: bool, deafened: bool },
     RoomName(String),
     Chat { from: Option<EndpointId>, name: String, text: String },
     MyStream(Option<StreamInfo>),
+    MyCamera(bool),
     MyVoice(bool),
     Watching(Option<EndpointId>),
     Status(String),
@@ -66,6 +68,7 @@ struct PeerConn {
     dialer: EndpointId,
     voice: bool,
     stream: Option<StreamInfo>,
+    camera: Option<StreamInfo>,
 }
 
 /// Local mute/deafen state, kept even when not in voice.
@@ -93,6 +96,9 @@ struct State {
     peers: HashMap<EndpointId, PeerConn>,
     dialing: HashSet<EndpointId>,
     broadcast: Option<video::encode::Broadcast>,
+    camera: Option<video::encode::Broadcast>,
+    /// Decoded cameras shown in voice tiles, ours (preview) included.
+    cam_views: HashMap<EndpointId, (Arc<FrameSlot>, tokio::task::JoinHandle<()>)>,
     watch: Option<Watch>,
     voice: Option<Arc<Voice>>,
 }
@@ -266,6 +272,10 @@ impl Node {
         }
         s.dialing.clear();
         s.broadcast = None;
+        s.camera = None;
+        for (_, (_, task)) in s.cam_views.drain() {
+            task.abort();
+        }
         if let Some(w) = s.watch.take() {
             w.task.abort();
         }
@@ -304,6 +314,7 @@ impl Node {
             room: s.room.clone(),
             peers: s.peers.keys().copied().collect(),
             stream: s.broadcast.as_ref().map(|b| b.info.clone()),
+            camera: s.camera.as_ref().map(|b| b.info.clone()),
             voice: s.voice.is_some(),
             muted: s.mute.muted,
             deafened: s.mute.deafened,
@@ -366,7 +377,7 @@ impl Node {
             (s, r)
         };
         proto::write_msg(&mut send, &self.hello()).await?;
-        let Msg::Hello { name, room, peers, stream, voice, muted, deafened, avatar } =
+        let Msg::Hello { name, room, peers, stream, camera, voice, muted, deafened, avatar } =
             tokio::time::timeout(Duration::from_secs(15), proto::read_msg(&mut recv)).await??
         else {
             bail!("expected hello");
@@ -408,6 +419,7 @@ impl Node {
                     dialer,
                     voice,
                     stream: stream.clone(),
+                    camera: None,
                 },
             );
         }
@@ -418,6 +430,7 @@ impl Node {
         self.emit(Event::PeerStream { id: remote, info: stream });
         self.emit(Event::PeerVoice { id: remote, on: voice });
         self.emit(Event::PeerMute { id: remote, muted, deafened });
+        self.set_peer_camera(remote, camera);
 
         // Complete the mesh.
         for p in peers {
@@ -450,9 +463,9 @@ impl Node {
                     if r.read_exact(&mut tag).await.is_err() {
                         continue;
                     }
-                    if tag[0] == TAG_WATCH {
+                    if tag[0] == TAG_WATCH || tag[0] == TAG_CAMERA {
                         let n = n.clone();
-                        tokio::spawn(async move { n.serve_viewer(s).await });
+                        tokio::spawn(async move { n.serve_viewer(s, tag[0] == TAG_CAMERA).await });
                     }
                 }
             });
@@ -494,6 +507,7 @@ impl Node {
                     }
                     self.emit(Event::PeerStream { id: remote, info });
                 }
+                Msg::Camera(info) => self.set_peer_camera(remote, info),
                 Msg::Voice(on) => {
                     {
                         let mut s = self.0.state.lock().unwrap();
@@ -528,6 +542,9 @@ impl Node {
             let mut s = self.0.state.lock().unwrap();
             if s.peers.get(&remote).is_some_and(|p| p.conn.stable_id() == stable) {
                 s.peers.remove(&remote);
+                if let Some((_, task)) = s.cam_views.remove(&remote) {
+                    task.abort();
+                }
                 if let Some(v) = &s.voice {
                     v.remove_peer(&remote);
                 }
@@ -620,8 +637,11 @@ impl Node {
         s.broadcast.as_ref().map(|b| b.hub.viewer_count()).unwrap_or(0)
     }
 
-    async fn serve_viewer(&self, mut send: iroh::endpoint::SendStream) {
-        let hub = self.0.state.lock().unwrap().broadcast.as_ref().map(|b| b.hub.clone());
+    async fn serve_viewer(&self, mut send: iroh::endpoint::SendStream, camera: bool) {
+        let hub = {
+            let s = self.0.state.lock().unwrap();
+            if camera { &s.camera } else { &s.broadcast }.as_ref().map(|b| b.hub.clone())
+        };
         let Some(hub) = hub else {
             let _ = send.finish();
             return;
@@ -634,6 +654,136 @@ impl Node {
             }
         }
         let _ = send.finish();
+    }
+
+    // ------------------------------------------------------------- camera
+
+    /// Turns our camera on. Peers decode it into their voice tiles; we decode
+    /// our own hub for the preview.
+    pub fn start_camera(&self, name: Option<String>) {
+        let n = self.clone();
+        self.spawn(async move {
+            let n2 = n.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                video::encode::start(&video::encode::Settings::camera(name), move |err| {
+                    let n3 = n2.clone();
+                    n2.0.rt.spawn(async move {
+                        if n3.0.state.lock().unwrap().camera.is_some() {
+                            n3.stop_camera();
+                            n3.emit(Event::Error(format!("Kamera przerwała pracę: {err}")));
+                        }
+                    });
+                })
+            })
+            .await;
+            match res {
+                Ok(Ok(b)) => {
+                    let (info, hub) = (b.info.clone(), b.hub.clone());
+                    {
+                        let mut s = n.0.state.lock().unwrap();
+                        if !s.in_room || s.voice.is_none() {
+                            return n.emit(Event::MyCamera(false)); // left while starting
+                        }
+                        s.camera = Some(b);
+                    }
+                    if let Some(me) = n.my_id() {
+                        let rx = hub.subscribe();
+                        n.view_camera(me, info.codec, async move { Ok(rx) });
+                    }
+                    n.broadcast_msg(Msg::Camera(Some(info)));
+                    n.emit(Event::MyCamera(true));
+                }
+                Ok(Err(e)) => {
+                    n.emit(Event::MyCamera(false));
+                    n.emit(Event::Error(format!("Nie można włączyć kamery: {e:#}")));
+                }
+                Err(e) => n.emit(Event::Error(format!("{e}"))),
+            }
+        });
+    }
+
+    pub fn stop_camera(&self) {
+        let (b, view) = {
+            let mut s = self.0.state.lock().unwrap();
+            let view = self.my_id().and_then(|me| s.cam_views.remove(&me));
+            (s.camera.take(), view)
+        };
+        if let Some((_, task)) = view {
+            task.abort();
+        }
+        if b.is_some() {
+            drop(b);
+            self.broadcast_msg(Msg::Camera(None));
+            self.emit(Event::MyCamera(false));
+        }
+    }
+
+    /// Latest decoded camera frames, by person (our id = preview).
+    pub fn camera_frames(&self) -> Vec<(EndpointId, Arc<FrameSlot>)> {
+        let s = self.0.state.lock().unwrap();
+        s.cam_views.iter().map(|(id, (slot, _))| (*id, slot.clone())).collect()
+    }
+
+    fn set_peer_camera(&self, id: EndpointId, info: Option<StreamInfo>) {
+        let conn = {
+            let mut s = self.0.state.lock().unwrap();
+            let Some(p) = s.peers.get_mut(&id) else { return };
+            p.camera = info.clone();
+            let conn = p.conn.clone();
+            if let Some((_, task)) = s.cam_views.remove(&id) {
+                task.abort();
+            }
+            conn
+        };
+        if let Some(info) = &info {
+            // ponytail: every camera is received even when nobody looks at the
+            // voice stage; subscribe on demand if bandwidth becomes a problem.
+            self.view_camera(id, info.codec, async move {
+                let (mut send, mut recv) = conn.open_bi().await?;
+                send.write_all(&[TAG_CAMERA]).await?;
+                let (tx, rx) = mpsc::channel(4);
+                tokio::spawn(async move {
+                    let _send = send; // keep the request stream open
+                    while let Ok(Some(chunk)) = recv.read_chunk(1 << 20).await {
+                        if tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(rx)
+            });
+        }
+        self.emit(Event::PeerCamera { id, on: info.is_some() });
+    }
+
+    /// Decodes a camera bitstream (from `source`) into a frame slot for `id`'s tile.
+    fn view_camera(
+        &self,
+        id: EndpointId,
+        codec: proto::Codec,
+        source: impl std::future::Future<Output = Result<mpsc::Receiver<Bytes>>> + Send + 'static,
+    ) {
+        let slot = Arc::new(FrameSlot::default());
+        let events = self.0.events.clone();
+        let slot2 = slot.clone();
+        let task = self.0.rt.spawn(async move {
+            let res: Result<()> = async {
+                let mut rx = source.await?;
+                let dec = video::decode::Decoder::start(codec, slot2, move || events.repaint())?;
+                while let Some(chunk) = rx.recv().await {
+                    dec.feed(chunk).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = res {
+                tracing::debug!("camera view ended: {e:#}");
+            }
+        });
+        let old = self.0.state.lock().unwrap().cam_views.insert(id, (slot, task));
+        if let Some((_, t)) = old {
+            t.abort();
+        }
     }
 
     pub fn watching(&self) -> Option<EndpointId> {
@@ -781,6 +931,7 @@ impl Node {
     }
 
     pub fn leave_voice(&self) {
+        self.stop_camera(); // video is part of the call, as on Discord
         let v = self.0.state.lock().unwrap().voice.take();
         if v.is_some() {
             drop(v);
@@ -821,6 +972,71 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "timeout");
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Frames decoded so far for `id`'s camera tile on `n`.
+    fn cam_count(n: &Node, id: EndpointId) -> u64 {
+        n.camera_frames().iter().find(|(i, _)| *i == id).map_or(0, |(_, s)| s.count())
+    }
+
+    async fn wait_cam_frames(n: &Node, id: EndpointId, min: u64) {
+        let start = Instant::now();
+        while cam_count(n, id) < min {
+            assert!(start.elapsed() < Duration::from_secs(30), "camera frames: {}", cam_count(n, id));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Camera next to a screen stream: peers (also late joiners) decode it
+    /// without asking, the sender sees a preview, leaving voice stops it.
+    /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg cargo test e2e_camera -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_camera() {
+        unsafe {
+            std::env::set_var("BIBICORD_TEST_SOURCE", "1");
+            std::env::set_var("BIBICORD_FAKE_AUDIO", "1");
+        }
+        tokio::task::spawn_blocking(|| crate::ffmpeg::ensure(|_| {})).await.unwrap().unwrap();
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+            unreachable!()
+        };
+        b.join(&t, "Bob".into()).unwrap();
+        wait_for(&brx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+        a.join_voice();
+        b.join_voice();
+        wait_for(&arx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        let ida = a.my_id().unwrap();
+
+        a.start_camera(None);
+        wait_for(&arx, 60, |e| matches!(e, Event::MyCamera(true))).await;
+        wait_for(&brx, 10, |e| matches!(e, Event::PeerCamera { on: true, .. })).await;
+        wait_cam_frames(&a, ida, 10).await; // preview
+        wait_cam_frames(&b, ida, 10).await;
+
+        // The screen stream is independent of the camera.
+        a.start_stream(Default::default());
+        wait_for(&brx, 60, |e| matches!(e, Event::PeerStream { info: Some(_), .. })).await;
+        let before = cam_count(&b, ida);
+        wait_cam_frames(&b, ida, before + 30).await;
+
+        let (c, crx) = node();
+        c.join(&t, "Cyryl".into()).unwrap();
+        wait_for(&crx, 30, |e| matches!(e, Event::PeerCamera { id, on: true } if *id == ida)).await;
+        wait_cam_frames(&c, ida, 10).await;
+
+        a.leave_voice();
+        wait_for(&brx, 10, |e| matches!(e, Event::PeerCamera { id, on: false } if *id == ida)).await;
+        assert!(b.camera_frames().is_empty());
+        let s = a.0.state.lock().unwrap();
+        assert!(s.camera.is_none() && s.broadcast.is_some());
+        drop(s);
+        for n in [a, b, c] {
+            n.leave();
         }
     }
 

@@ -23,6 +23,7 @@ pub(crate) struct PeerView {
     pub id: EndpointId,
     pub name: String,
     pub stream: Option<StreamInfo>,
+    pub camera: bool,
     pub voice: bool,
     pub mute: MuteState,
     pub color: egui::Color32,
@@ -94,6 +95,13 @@ pub struct App {
 
     pub(crate) my_stream: Option<StreamInfo>,
     pub(crate) stream_starting: bool,
+    pub(crate) camera_on: bool,
+    pub(crate) camera_starting: bool,
+    /// Selected camera (FFmpeg name); `None` = first one.
+    pub(crate) camera: Option<String>,
+    pub(crate) cameras: Vec<String>,
+    /// Latest camera frame per person (our id = preview) and its size.
+    pub(crate) cam_tex: std::collections::HashMap<EndpointId, (TextureHandle, egui::Vec2)>,
     pub(crate) settings: Settings,
     pub(crate) displays: Vec<String>,
     pub(crate) audio_devices: Option<(Vec<crate::voice::DeviceInfo>, Vec<crate::voice::DeviceInfo>)>,
@@ -178,6 +186,11 @@ impl App {
             stage_chat: false,
             my_stream: None,
             stream_starting: false,
+            camera_on: false,
+            camera_starting: false,
+            camera: None,
+            cameras: Vec::new(),
+            cam_tex: Default::default(),
             settings: Settings::default(),
             displays: Vec::new(),
             audio_devices: None,
@@ -286,6 +299,7 @@ impl App {
                             id,
                             name,
                             stream: None,
+                            camera: false,
                             voice: false,
                             mute: MuteState::default(),
                             color: theme::avatar_color(id.as_bytes()),
@@ -371,6 +385,21 @@ impl App {
                     }
                     self.my_stream = info;
                 }
+                Event::PeerCamera { id, on } => {
+                    if let Some(p) = self.peers.iter_mut().find(|p| p.id == id) {
+                        p.camera = on;
+                    }
+                    if !on {
+                        self.cam_tex.remove(&id);
+                    }
+                }
+                Event::MyCamera(on) => {
+                    self.camera_starting = false;
+                    self.camera_on = on;
+                    if let (false, Some(me)) = (on, self.my_id) {
+                        self.cam_tex.remove(&me);
+                    }
+                }
                 Event::MyVoice(on) => {
                     self.voice_starting = false;
                     // Device changes reconnect without a "false" in between.
@@ -389,6 +418,7 @@ impl App {
                 Event::Status(s) => self.status = s,
                 Event::Error(e) => {
                     self.stream_starting = false;
+                    self.camera_starting = false;
                     self.voice_starting = false;
                     self.status.clear();
                     self.error = Some((e, Instant::now()));
@@ -419,6 +449,9 @@ impl App {
         self.ticket = None;
         self.room.clear();
         self.my_stream = None;
+        self.camera_on = false;
+        self.camera_starting = false;
+        self.cam_tex.clear();
         self.my_voice = false;
         self.watching = None;
         self.texture = None;
@@ -476,8 +509,41 @@ impl App {
         self.dialog = Some(Dialog::GoLive);
     }
 
+    /// Camera on/off. It is part of the voice call and separate from the
+    /// screen stream; turning it on shows the stage with the preview tile.
+    pub(crate) fn toggle_camera(&mut self) {
+        if self.camera_on {
+            self.node.stop_camera();
+        } else if !self.camera_starting && self.my_voice {
+            self.camera_starting = true;
+            self.view = View::Voice;
+            self.node.start_camera(self.camera.clone());
+        }
+    }
+
+    /// Moves the newest decoded camera frames into textures.
+    pub(crate) fn pull_cameras(&mut self, ctx: &egui::Context) {
+        for (id, slot) in self.node.camera_frames() {
+            let Some(fr) = slot.take() else { continue };
+            let img = egui::ColorImage::from_rgba_unmultiplied([fr.width, fr.height], &fr.rgba);
+            let size = egui::vec2(fr.width as f32, fr.height as f32);
+            match self.cam_tex.get_mut(&id) {
+                Some((t, s)) => {
+                    t.set(img, egui::TextureOptions::LINEAR);
+                    *s = size;
+                }
+                None => {
+                    let t = ctx.load_texture(format!("camera {id}"), img, egui::TextureOptions::LINEAR);
+                    self.cam_tex.insert(id, (t, size));
+                }
+            }
+        }
+    }
+
     pub(crate) fn open_settings(&mut self) {
         self.audio_devices = Some(crate::voice::list_devices());
+        // ponytail: blocks the UI for one ffmpeg run (~0.3 s); move to a thread if it gets slow.
+        self.cameras = crate::video::encode::cameras();
         self.dialog = Some(Dialog::Settings);
     }
 
@@ -614,6 +680,10 @@ impl App {
         if d.stream && !d.stream_started && !self.peers.is_empty() && crate::ffmpeg::path().is_some() {
             d.stream_started = true;
             self.node.start_stream(self.settings.clone());
+        }
+        if d.camera && !d.camera_started && self.my_voice && crate::ffmpeg::path().is_some() {
+            d.camera_started = true;
+            self.toggle_camera();
         }
         if d.watch && self.watching.is_none() {
             if let Some(id) = self.peers.iter().find(|p| p.stream.is_some()).map(|p| p.id) {

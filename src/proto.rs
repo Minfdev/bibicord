@@ -7,11 +7,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on every incompatible change; mismatched versions get a clear
 /// "update the app" error instead of garbled messages.
-pub const ALPN: &[u8] = b"bibicord/4";
+pub const ALPN: &[u8] = b"bibicord/5";
 
 /// First byte of every bidirectional stream.
 pub const TAG_CONTROL: u8 = 0;
 pub const TAG_WATCH: u8 = 1;
+pub const TAG_CAMERA: u8 = 2;
 
 /// First byte of every datagram.
 pub const DGRAM_VOICE: u8 = 1;
@@ -58,6 +59,8 @@ pub enum Msg {
         room: String,
         peers: Vec<EndpointId>,
         stream: Option<StreamInfo>,
+        /// Webcam, separate from the screen stream.
+        camera: Option<StreamInfo>,
         voice: bool,
         muted: bool,
         deafened: bool,
@@ -68,6 +71,7 @@ pub enum Msg {
         text: String,
     },
     Stream(Option<StreamInfo>),
+    Camera(Option<StreamInfo>),
     Voice(bool),
     Mute {
         muted: bool,

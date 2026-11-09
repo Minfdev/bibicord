@@ -3,6 +3,7 @@
 //! * Windows 10/11: FFmpeg `ddagrab` (Desktop Duplication, GPU frames)
 //!   straight into NVENC / AMF, or QSV / Media Foundation / x264 as fallback.
 //! * macOS: ScreenCaptureKit (native, NV12) piped into VideoToolbox.
+//! * Camera: FFmpeg `dshow` (Windows) / `avfoundation` (macOS), same encoders.
 //!
 //! The encoder writes a raw Annex B bitstream which goes into the [`Hub`].
 
@@ -18,8 +19,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// What gets captured.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    Screen,
+    /// Camera by its FFmpeg device name; `None` = the first camera found.
+    Camera(Option<String>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
+    pub source: Source,
     pub codec: Codec,
     pub fps: u32,
     pub bitrate_kbps: u32,
@@ -31,12 +41,20 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            source: Source::Screen,
             codec: Codec::H264,
             fps: 60,
             bitrate_kbps: 30_000,
             display: 0,
             max_height: 0,
         }
+    }
+}
+
+impl Settings {
+    /// Webcam: 720p30 at a Discord-like bitrate (each viewer gets its own copy).
+    pub fn camera(name: Option<String>) -> Self {
+        Settings { source: Source::Camera(name), fps: 30, bitrate_kbps: 2_500, ..Default::default() }
     }
 }
 
@@ -90,6 +108,8 @@ pub fn start(s: &Settings, on_exit: impl FnOnce(String) + Send + 'static) -> Res
             .to_vec();
         a.push(format!("testsrc2=size=1920x1080:rate={}", s.fps));
         (enc, a, Input::None { width: 1920, height: 1080 })
+    } else if let Source::Camera(name) = &s.source {
+        camera_input(s, name.as_deref())?
     } else {
         platform::input(s)?
     };
@@ -205,6 +225,93 @@ enum Input {
 type CaptureHandle = screencapturekit::stream::SCStream;
 #[cfg(not(target_os = "macos"))]
 type CaptureHandle = ();
+
+const CAMERA_FORMAT: &str = if cfg!(windows) {
+    "dshow"
+} else if cfg!(target_os = "macos") {
+    "avfoundation"
+} else {
+    "v4l2"
+};
+
+/// Names of connected cameras, as FFmpeg sees them. Blocking (runs ffmpeg).
+pub fn cameras() -> Vec<String> {
+    if test_source() {
+        return vec!["Kamera testowa".into()];
+    }
+    let Ok(mut cmd) = ffmpeg::command() else { return Vec::new() };
+    let dummy = if cfg!(windows) { "dummy" } else { "" };
+    cmd.args(["-list_devices", "true", "-f", CAMERA_FORMAT, "-i", dummy])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    match cmd.output() {
+        Ok(out) => parse_cameras(&String::from_utf8_lossy(&out.stderr)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parses `-list_devices` output of dshow (old and new style) and avfoundation.
+fn parse_cameras(log: &str) -> Vec<String> {
+    let mut video = false;
+    let mut out = Vec::new();
+    for line in log.lines() {
+        // Drop the `[dshow @ 0x..] ` prefix.
+        let l = line.split_once("] ").map_or(line, |(_, rest)| rest).trim();
+        if l.contains("video devices") {
+            video = true;
+        } else if l.contains("audio devices") {
+            video = false;
+        } else if let Some(name) = l.strip_suffix("(video)") {
+            out.push(name.trim().trim_matches('"').to_string());
+        } else if !video || l.ends_with(')') || l.starts_with("Alternative name") {
+            continue;
+        } else if l.starts_with('"') {
+            out.push(l.trim_matches('"').to_string());
+        } else if let Some((_, name)) = l.strip_prefix('[').and_then(|r| r.split_once("] ")) {
+            if !name.starts_with("Capture screen") {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn camera_input(s: &Settings, name: Option<&str>) -> Result<(&'static str, Vec<String>, Input)> {
+    let name = match name {
+        Some(n) => n.to_string(),
+        None => cameras().into_iter().next().context("nie znaleziono kamery")?,
+    };
+    let enc = pick_encoder(s.codec, |enc| {
+        let mut a = lavfi_probe_input();
+        a.extend(encoder_args(enc, s));
+        a
+    })?;
+    let device = if cfg!(windows) { format!("video={name}") } else { name };
+    let input = |mode: &[&str]| {
+        let mut a: Vec<String> = ["-f", CAMERA_FORMAT].map(String::from).to_vec();
+        if cfg!(windows) {
+            a.extend(["-rtbufsize".into(), "100M".into()]);
+        }
+        a.extend(mode.iter().map(|m| m.to_string()));
+        a.extend(["-i".into(), device.clone()]);
+        a
+    };
+    // Ask for 720p30; cameras that refuse it run in their default mode.
+    // ponytail: one fixed mode, list the camera's modes if 720p is commonly missing.
+    let hd = ["-video_size", "1280x720", "-framerate", "30"];
+    let mut probe = input(&hd);
+    probe.extend(["-frames:v", "1", "-f", "null", "-"].map(String::from));
+    let mut a = if ffmpeg::probe(&probe, Duration::from_secs(8)) {
+        input(&hd)
+    } else if cfg!(target_os = "macos") {
+        input(&["-framerate", "30"]) // avfoundation rejects its 29.97 default on most cameras
+    } else {
+        input(&[])
+    };
+    // Cameras deliver YUYV or MJPEG; hardware encoders want NV12.
+    a.extend(["-vf".into(), "format=nv12".into()]);
+    Ok((enc, a, Input::None { width: 0, height: 0 }))
+}
 
 fn lavfi_probe_input() -> Vec<String> {
     ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30", "-frames:v", "5"]
@@ -505,5 +612,52 @@ mod platform {
             .map(String::from)
             .to_vec();
         Ok((enc, a, Input::None { width: 0, height: 0 }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_camera_lists() {
+        let dshow = r#"[dshow @ 000001] "Integrated Webcam" (video)
+[dshow @ 000001]   Alternative name "@device_pnp_\\?\usb#vid"
+[dshow @ 000001] "OBS Virtual Camera" (none)
+[dshow @ 000001] "Mikrofon (Realtek)" (audio)
+dummy: Immediate exit requested"#;
+        assert_eq!(super::parse_cameras(dshow), ["Integrated Webcam"]);
+
+        let old = r#"[dshow @ 01] DirectShow video devices (some may be both video and audio devices)
+[dshow @ 01]  "HD Pro Webcam C920"
+[dshow @ 01]     Alternative name "@device_pnp_x"
+[dshow @ 01] DirectShow audio devices
+[dshow @ 01]  "Mikrofon"
+"#;
+        assert_eq!(super::parse_cameras(old), ["HD Pro Webcam C920"]);
+
+        let mac = "[AVFoundation indev @ 0x1] AVFoundation video devices:\n\
+                   [AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n\
+                   [AVFoundation indev @ 0x1] [1] Capture screen 0\n\
+                   [AVFoundation indev @ 0x1] AVFoundation audio devices:\n\
+                   [AVFoundation indev @ 0x1] [0] MacBook Pro Microphone\n";
+        assert_eq!(super::parse_cameras(mac), ["FaceTime HD Camera"]);
+    }
+
+    /// Real camera -> encoder -> hub. Needs a camera.
+    /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg cargo test camera_stream -- --ignored
+    #[test]
+    #[ignore]
+    fn camera_stream() {
+        crate::ffmpeg::ensure(|_| {}).unwrap();
+        println!("cameras: {:?}", super::cameras());
+        let b = super::start(&super::Settings::camera(None), |e| panic!("encoder died: {e}")).unwrap();
+        println!("{:?}", b.info);
+        let mut rx = b.hub.subscribe();
+        let start = std::time::Instant::now();
+        let mut bytes = 0;
+        while bytes < 50_000 {
+            assert!(start.elapsed().as_secs() < 15, "only {bytes} B of video");
+            bytes += rx.blocking_recv().expect("stream ended").len();
+        }
+        println!("{bytes} B after {:?}", start.elapsed());
     }
 }

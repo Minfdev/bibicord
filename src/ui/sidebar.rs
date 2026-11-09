@@ -18,6 +18,9 @@ pub(crate) struct Member {
     pub live: bool,
     pub mute: MuteState,
     pub speaking: bool,
+    pub camera: bool,
+    /// Latest camera frame and its size.
+    pub video: Option<(egui::TextureHandle, Vec2)>,
 }
 
 impl App {
@@ -35,6 +38,8 @@ impl App {
             live: self.my_stream.is_some(),
             mute: self.mute,
             speaking: me_speaking && !self.mute.muted && !self.mute.deafened,
+            camera: self.camera_on,
+            video: self.my_id.and_then(|me| self.cam_tex.get(&me).cloned()).filter(|_| self.camera_on),
         }];
         for p in &self.peers {
             v.push(Member {
@@ -46,6 +51,8 @@ impl App {
                 live: p.stream.is_some(),
                 mute: p.mute,
                 speaking: speaking.contains(&p.id) && p.voice,
+                camera: p.camera,
+                video: self.cam_tex.get(&p.id).cloned().filter(|_| p.camera),
             });
         }
         v
@@ -250,6 +257,10 @@ impl App {
             right = b.left() - 6.0;
             clicked_live = m.id.is_some();
         }
+        if m.camera {
+            w::paint_icon(ui, Pos2::new(right - 8.0, rect.center().y), ic::VIDEO_CAMERA, 15.0, c::TEXT_MUTED, false);
+            right -= 20.0;
+        }
         if m.mute.deafened {
             w::paint_icon(ui, Pos2::new(right - 8.0, rect.center().y), ic::SPEAKER_SIMPLE_SLASH, 15.0, c::DANGER, false);
             right -= 20.0;
@@ -385,27 +396,48 @@ impl App {
                 };
                 ui.label(w::text(format!("{} fps · {n}", info.fps), ty::CAPTION, c::TEXT_MUTED));
             });
-            if Button::new("Zakończ stream", Kind::Danger)
-                .icon(ic::MONITOR_ARROW_UP)
-                .width(width)
+        }
+        // Camera and screen side by side, as on Discord.
+        let ffmpeg = crate::ffmpeg::path().is_some();
+        let half = (width - ui.spacing().item_spacing.x) / 2.0;
+        let (mut camera, mut screen) = (false, false);
+        ui.horizontal(|ui| {
+            let (label, kind, tip) = match (self.camera_on, self.camera_starting) {
+                (true, _) => ("Kamera", Kind::Primary, "Wyłącz kamerę"),
+                (false, true) => ("Kamera…", Kind::Secondary, "Uruchamianie kamery"),
+                _ => ("Kamera", Kind::Secondary, "Włącz kamerę"),
+            };
+            let icon = if self.camera_on { ic::VIDEO_CAMERA } else { ic::VIDEO_CAMERA_SLASH };
+            let enabled = ffmpeg && self.my_voice && !self.camera_starting;
+            camera = Button::new(label, kind)
+                .icon(icon)
+                .width(half)
                 .height(34.0)
+                .enabled(enabled)
                 .show(ui)
-                .clicked()
-            {
-                self.node.stop_stream();
-            }
-        } else {
-            let ready = crate::ffmpeg::path().is_some() && !self.stream_starting;
-            let label = if self.stream_starting { "Uruchamianie streamu…" } else { "Udostępnij ekran" };
-            let resp = Button::new(label, Kind::Secondary)
+                .on_hover_text(if self.my_voice { tip } else { "Dołącz do głosu, aby włączyć kamerę" })
+                .clicked();
+            let (label, kind, tip) = match (self.my_stream.is_some(), self.stream_starting) {
+                (true, _) => ("Zakończ", Kind::Danger, "Zakończ stream"),
+                (false, true) => ("Ekran…", Kind::Secondary, "Uruchamianie streamu"),
+                _ => ("Ekran", Kind::Secondary, "Udostępnij ekran"),
+            };
+            screen = Button::new(label, kind)
                 .icon(ic::MONITOR_ARROW_UP)
-                .width(width)
+                .width(half)
                 .height(34.0)
-                .enabled(ready)
-                .show(ui);
-            if resp.clicked() {
-                self.open_go_live();
-            }
+                .enabled(ffmpeg && !self.stream_starting)
+                .show(ui)
+                .on_hover_text(tip)
+                .clicked();
+        });
+        if camera {
+            self.toggle_camera();
+        }
+        if screen && self.my_stream.is_some() {
+            self.node.stop_stream();
+        } else if screen {
+            self.open_go_live();
         }
         if !self.status.is_empty() {
             ui.label(w::text(&self.status, ty::CAPTION, c::TEXT_MUTED));
@@ -449,6 +481,8 @@ impl App {
                 "Wyciszony"
             } else if self.my_stream.is_some() {
                 "Udostępnia ekran"
+            } else if self.camera_on {
+                "Kamera włączona"
             } else if self.my_voice {
                 "Na kanale głosowym"
             } else {

@@ -330,11 +330,20 @@ impl App {
     }
 
     fn settings_ui(&mut self, ui: &mut Ui) {
-        if header(ui, "Ustawienia głosu", "Urządzenia audio używane w rozmowie.") {
+        if header(ui, "Ustawienia głosu", "Mikrofon, głośniki i kamera używane w rozmowie.") {
             self.dialog = None;
         }
         body(ui, |ui| {
             self.audio_settings(ui);
+            ui.add_space(sp::L);
+            w::separator(ui, c::BORDER);
+            ui.add_space(sp::M);
+            w::field_label(ui, "Kamera");
+            let cams: Vec<_> = self.cameras.iter().map(|n| crate::voice::DeviceInfo { id: n.clone(), name: n.clone() }).collect();
+            device_combo(ui, "dev_cam", &mut self.camera, &cams);
+            if self.cameras.is_empty() {
+                ui.label(w::text("Nie znaleziono kamery.", ty::SMALL, c::TEXT_MUTED));
+            }
             ui.add_space(sp::L);
             w::separator(ui, c::BORDER);
             ui.add_space(sp::M);
