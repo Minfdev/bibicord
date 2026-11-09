@@ -2,9 +2,12 @@
 # Builds dist/BibiCord-Setup-<version>.exe: one-file Windows 10/11 installer
 # with bibicord.exe and a bundled FFmpeg (no download on first run).
 #
-# Needs: rustup target x86_64-pc-windows-gnu, mingw-w64, makensis
-#   (macOS: brew install mingw-w64 makensis; Linux: apt install mingw-w64 nsis).
+# Needs: rustup target x86_64-pc-windows-gnu, mingw-w64, makensis, and for
+#   FFmpeg nasm, cmake, pkg-config (macOS: brew install mingw-w64 makensis
+#   nasm cmake pkgconf; Linux: apt install mingw-w64 nsis nasm cmake pkg-config).
 # Usage: scripts/build-windows-installer.sh [path/to/ffmpeg.exe]
+#   Without an argument FFmpeg is built by scripts/build-ffmpeg.sh windows.
+#   The argument must be such a build (CI passes it from the ffmpeg job).
 set -eu
 cd "$(dirname "$0")/.."
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -17,17 +20,8 @@ cargo build --release --target "$TARGET"
 
 FF="${1:-}"
 if [ -z "$FF" ]; then
-  FF="$CACHE/ffmpeg.exe"
-  if [ ! -f "$FF" ]; then
-    # Static GPL build: ddagrab capture, NVENC / AMF / QSV / MF / x264.
-    echo "Pobieranie FFmpeg (BtbN FFmpeg-Builds)…"
-    curl -fL --retry 3 -o "$CACHE/ffmpeg-win.zip" \
-      https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-9.0.zip
-    rm -rf "$CACHE/ffmpeg-win"
-    unzip -q -o "$CACHE/ffmpeg-win.zip" -d "$CACHE/ffmpeg-win"
-    cp "$CACHE"/ffmpeg-win/*/bin/ffmpeg.exe "$FF"
-    cp "$CACHE"/ffmpeg-win/*/LICENSE.txt "$CACHE/FFmpeg-LICENSE.txt" 2>/dev/null || true
-  fi
+  scripts/build-ffmpeg.sh windows
+  FF=target/pkg/ffmpeg/windows/ffmpeg.exe
 fi
 
 rm -rf "$STAGE"
@@ -36,11 +30,7 @@ cp "target/$TARGET/release/bibicord.exe" "$STAGE/"
 cp "$FF" "$STAGE/ffmpeg.exe"
 cp packaging/icon/icon.ico "$STAGE/"
 scripts/licenses.sh "$STAGE/licenses" "$TARGET"
-if [ -f "$CACHE/FFmpeg-LICENSE.txt" ]; then
-  cp "$CACHE/FFmpeg-LICENSE.txt" "$STAGE/licenses/FFmpeg-GPL.txt"
-else
-  echo "FFmpeg: GPL v3, https://ffmpeg.org/legal.html" > "$STAGE/licenses/FFmpeg-GPL.txt"
-fi
+scripts/ffmpeg-notice.sh "$STAGE/licenses" "$FF" "$VERSION"
 
 OUT="dist/BibiCord-Setup-$VERSION.exe"
 ROOT=$(pwd -W 2>/dev/null || pwd)  # Git Bash on Windows needs a native path

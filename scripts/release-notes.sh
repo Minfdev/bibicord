@@ -23,4 +23,7 @@ Masz już BibiCord? Aplikacja sama zaproponuje aktualizację.
 - macOS: po pierwszej próbie otwarcia Ustawienia systemowe → Prywatność i ochrona → „Otwórz mimo to”.
 
 Wszyscy w pokoju muszą mieć tę samą wersję.
+
+Instalatory zawierają FFmpeg na licencji GPL v3. Kompletny kod źródłowy
+(FFmpeg, x264, x265, skrypty budowania) jest w pliku `ffmpeg-source.tar`.
 MD
