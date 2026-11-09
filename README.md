@@ -190,8 +190,22 @@ spoza listy `accepted` przerywa budowanie instalatora.
 
 ### FFmpeg
 
-Pobierane/dołączane buildy FFmpeg są na licencji GPL. Przy dystrybucji
-paczek z FFmpeg obowiązują jej warunki.
+Instalatory dołączają FFmpeg na licencji GPL v3. Buildy są przypięte
+w `packaging/ffmpeg.env` (adres, wersja, suma SHA-256):
+
+* Windows: [BtbN FFmpeg-Builds](https://github.com/FFmpeg-Builds/FFmpeg-Builds),
+  build miesięczny (przechowywany przez dwa lata),
+* macOS: [Martin Riedl](https://ffmpeg.martin-riedl.de), wydanie FFmpeg
+  ([skrypty budowania](https://git.martin-riedl.de/ffmpeg/build-script)).
+
+W folderze `licenses` jest pełny tekst GPL v3 (`FFmpeg-GPL.txt`) oraz
+`FFmpeg-SOURCE.txt` z wersją i adresem kodu źródłowego. Każdy release
+zawiera źródła dołączonych wersji FFmpeg (`ffmpeg-source-windows.tar.gz`,
+`ffmpeg-source-macos.tar.xz`). Zmiana buildu: nowy adres, suma, wersja
+i źródło w `packaging/ffmpeg.env` naraz.
+
+FFmpeg pobierany przez samą aplikację, gdy go brakuje (np. przy
+uruchomieniu z `cargo run`), pochodzi od dostawców `ffmpeg-sidecar`.
 
 ## Znaki towarowe
 

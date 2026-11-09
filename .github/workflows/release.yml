@@ -75,9 +75,14 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: FFmpeg source (GPL)
+        run: |
+          . packaging/ffmpeg.env
+          scripts/fetch.sh "$FFMPEG_WIN_SOURCE_URL" "" dist/ffmpeg-source-windows.tar.gz
+          scripts/fetch.sh "$FFMPEG_MAC_SOURCE_URL" "$FFMPEG_MAC_SOURCE_SHA256" dist/ffmpeg-source-macos.tar.xz
       - name: Checksums and notes
         run: |
-          cd dist && sha256sum BibiCord-Setup.exe BibiCord.dmg > SHA256SUMS.txt && cd ..
+          cd dist && sha256sum BibiCord-Setup.exe BibiCord.dmg ffmpeg-source-windows.tar.gz ffmpeg-source-macos.tar.xz > SHA256SUMS.txt && cd ..
           scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
       - uses: softprops/action-gh-release@v2
         with:
@@ -86,3 +91,5 @@ jobs:
             dist/BibiCord-Setup.exe
             dist/BibiCord.dmg
             dist/SHA256SUMS.txt
+            dist/ffmpeg-source-windows.tar.gz
+            dist/ffmpeg-source-macos.tar.xz
