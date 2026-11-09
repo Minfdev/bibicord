@@ -1,7 +1,8 @@
 //! Scripted runs for automated testing and screenshots, driven by env vars:
 //! `BIBICORD_DEMO_NAME`, `BIBICORD_DEMO_ROOM`, `BIBICORD_DEMO_CREATE=<file>`
 //! (writes invite), `BIBICORD_DEMO_JOIN=<file>` (reads invite),
-//! `BIBICORD_DEMO_CHAT=a|b`, `BIBICORD_DEMO_STREAM=1`, `BIBICORD_DEMO_WATCH=1`,
+//! `BIBICORD_DEMO_CHAT=a|b`, `BIBICORD_DEMO_FILES=<file>|<file>` (sent after chat), `BIBICORD_DEMO_DROP=1` (file drop overlay),
+//! `BIBICORD_DEMO_SAVED=1` (first chat file shown as saved), `BIBICORD_DEMO_STREAM=1`, `BIBICORD_DEMO_WATCH=1`,
 //! `BIBICORD_DEMO_VOICE=1`, `BIBICORD_DEMO_CAMERA=1`, `BIBICORD_DEMO_MUTE=1`, `BIBICORD_DEMO_VIEW=voice`,
 //! `BIBICORD_DEMO_STAGE_CHAT=1`, `BIBICORD_DEMO_DIALOG=golive|settings|invite|update|share|profile`,
 //! `BIBICORD_DEMO_AVATAR=<image>` (not saved),
@@ -17,6 +18,7 @@ pub struct Demo {
     pub create: Option<PathBuf>,
     pub join: Option<PathBuf>,
     pub chat: Vec<String>,
+    pub files: Vec<PathBuf>,
     pub stream: bool,
     pub watch: bool,
     pub voice: bool,
@@ -51,6 +53,9 @@ impl Demo {
             join: var("BIBICORD_DEMO_JOIN").map(PathBuf::from),
             chat: var("BIBICORD_DEMO_CHAT")
                 .map(|s| s.split('|').map(String::from).collect())
+                .unwrap_or_default(),
+            files: var("BIBICORD_DEMO_FILES")
+                .map(|s| s.split('|').map(PathBuf::from).collect())
                 .unwrap_or_default(),
             stream: var("BIBICORD_DEMO_STREAM").is_some(),
             watch: var("BIBICORD_DEMO_WATCH").is_some(),

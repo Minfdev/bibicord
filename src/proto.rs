@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on every incompatible change; mismatched versions get a clear
 /// "update the app" error instead of garbled messages.
-pub const ALPN: &[u8] = b"bibicord/5";
+pub const ALPN: &[u8] = b"bibicord/6";
 
 /// First byte of every bidirectional stream.
 pub const TAG_CONTROL: u8 = 0;
@@ -18,6 +18,15 @@ pub const TAG_CAMERA: u8 = 2;
 pub const DGRAM_VOICE: u8 = 1;
 
 const MAX_FRAME: usize = 1 << 20;
+
+/// Largest file sent in chat (test version: one control message, no chunking).
+pub const MAX_FILE_BYTES: usize = 1_000_000;
+
+/// Longest file name, in characters.
+pub const MAX_FILE_NAME: usize = 100;
+
+// A file message (data, name in UTF-8, postcard overhead) must fit in a frame.
+const _: () = assert!(MAX_FILE_BYTES + 4 * MAX_FILE_NAME + 32 <= MAX_FRAME);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Codec {
@@ -82,6 +91,11 @@ pub enum Msg {
         name: String,
         avatar: Option<Vec<u8>>,
     },
+    /// File posted in chat, at most `MAX_FILE_BYTES`.
+    File {
+        name: String,
+        data: Vec<u8>,
+    },
 }
 
 /// Longest display name, in characters.
@@ -93,6 +107,28 @@ pub fn clean_name(name: &str) -> String {
     one_line.trim().chars().take(MAX_NAME).collect::<String>().trim().to_string()
 }
 
+/// File name safe to offer in a save dialog: no path, no control characters
+/// or separators, bounded length (the extension is kept), never empty.
+pub fn clean_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let base: String = base
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let base = base.trim().trim_matches('.').trim();
+    if base.is_empty() {
+        return "plik".into();
+    }
+    if base.chars().count() <= MAX_FILE_NAME {
+        return base.to_string();
+    }
+    let ext = base.rsplit_once('.').map(|(_, e)| e).filter(|e| e.chars().count() <= 16).unwrap_or("");
+    let keep = if ext.is_empty() { MAX_FILE_NAME } else { MAX_FILE_NAME - ext.chars().count() - 1 };
+    let stem: String = base.chars().take(keep).collect();
+    let stem = stem.trim_end();
+    if ext.is_empty() { stem.to_string() } else { format!("{stem}.{ext}") }
+}
+
 pub async fn write_msg(w: &mut (impl AsyncWrite + Unpin), msg: &Msg) -> Result<()> {
     let bytes = postcard::to_stdvec(msg)?;
     w.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
@@ -102,14 +138,22 @@ pub async fn write_msg(w: &mut (impl AsyncWrite + Unpin), msg: &Msg) -> Result<(
 
 pub async fn read_msg(r: &mut (impl AsyncRead + Unpin)) -> Result<Msg> {
     let mut len = [0u8; 4];
-    r.read_exact(&mut len).await?;
-    let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_FRAME {
-        bail!("frame too large: {len}");
+    loop {
+        r.read_exact(&mut len).await?;
+        let len = u32::from_le_bytes(len) as usize;
+        if len > MAX_FRAME {
+            // Skip it instead of dropping the peer (e.g. a too large file).
+            tracing::warn!("skipping frame of {len} bytes");
+            let skipped = tokio::io::copy(&mut (&mut *r).take(len as u64), &mut tokio::io::sink()).await?;
+            if skipped < len as u64 {
+                bail!("stream ended inside a frame");
+            }
+            continue;
+        }
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf).await?;
+        return Ok(postcard::from_bytes(&buf)?);
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(postcard::from_bytes(&buf)?)
 }
 
 // ------------------------------------------------------------------ invites
@@ -201,5 +245,39 @@ mod tests {
         assert_eq!(clean_name("  Ala\n Kot "), "Ala  Kot");
         assert_eq!(clean_name(&"x".repeat(50)).chars().count(), MAX_NAME);
         assert_eq!(clean_name(" \t "), "");
+    }
+
+    #[test]
+    fn file_names_are_cleaned() {
+        assert_eq!(clean_file_name("raport.pdf"), "raport.pdf");
+        assert_eq!(clean_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(clean_file_name("..\\..\\Windows\\win.ini"), "win.ini");
+        assert_eq!(clean_file_name("/abs/path/a b.txt"), "a b.txt");
+        assert_eq!(clean_file_name("zły\nplik\0.txt"), "zły_plik_.txt");
+        assert_eq!(clean_file_name("C:evil.txt"), "C_evil.txt");
+        for bad in ["", "..", ".", "dir/", " / ", "\\"] {
+            assert_eq!(clean_file_name(bad), "plik", "{bad:?}");
+        }
+        let long = format!("{}.tar.gz", "x".repeat(300));
+        let c = clean_file_name(&long);
+        assert_eq!(c.chars().count(), MAX_FILE_NAME);
+        assert!(c.ends_with("x.gz"));
+        assert_eq!(clean_file_name(&"ą".repeat(300)).chars().count(), MAX_FILE_NAME);
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_skipped() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 16);
+        let big = Msg::File { name: "big.bin".into(), data: vec![1; MAX_FRAME + 10] };
+        let small = Msg::File { name: "ok.bin".into(), data: vec![2; MAX_FILE_BYTES] };
+        let writer = tokio::spawn(async move {
+            write_msg(&mut a, &big).await.unwrap();
+            write_msg(&mut a, &small).await.unwrap();
+            write_msg(&mut a, &Msg::Chat { text: "dalej".into() }).await.unwrap();
+        });
+        let Msg::File { name, data } = read_msg(&mut b).await.unwrap() else { panic!() };
+        assert_eq!((name.as_str(), data.len()), ("ok.bin", MAX_FILE_BYTES));
+        assert!(matches!(read_msg(&mut b).await.unwrap(), Msg::Chat { text } if text == "dalej"));
+        writer.await.unwrap();
     }
 }
