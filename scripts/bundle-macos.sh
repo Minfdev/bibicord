@@ -28,8 +28,7 @@ if [ -z "$FF" ]; then
 fi
 cp "$FF" "$APP/Contents/Resources/ffmpeg"
 chmod +x "$APP/Contents/Resources/ffmpeg"
-mkdir -p "$APP/Contents/Resources/licenses"
-cp assets/fonts/Inter-LICENSE.txt "$APP/Contents/Resources/licenses/Inter-OFL.txt"
+scripts/licenses.sh "$APP/Contents/Resources/licenses" aarch64-apple-darwin
 echo "FFmpeg: GPL v3, https://ffmpeg.org/legal.html" > "$APP/Contents/Resources/licenses/FFmpeg-GPL.txt"
 # Ad-hoc signature (no Apple Developer ID): Gatekeeper asks once on first launch.
 codesign --force --deep --sign - "$APP"
