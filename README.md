@@ -39,6 +39,10 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
 |---|---|---|
 | ![](docs/screenshots/2-chat.png) | ![](docs/screenshots/3-voice.png) | ![](docs/screenshots/5-dialog-golive.png) |
 
+| Pliki na czacie | Przeciąganie pliku | Czat obok kanału głosowego |
+|---|---|---|
+| ![](docs/screenshots/6-chat-files.png) | ![](docs/screenshots/6-chat-files-drop.png) | ![](docs/screenshots/6-chat-files-voice.png) |
+
 ## Jak to działa
 
 - **Sieć: P2P.** Każdy uczestnik łączy się z każdym bezpośrednio

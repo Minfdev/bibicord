@@ -691,6 +691,14 @@ impl App {
                 self.send_file_path(&path);
             }
         }
+        if std::env::var_os("BIBICORD_DEMO_SAVED").is_some() {
+            // Look of a saved file, without the save dialog.
+            if let Some(ChatKind::File { saved, .. }) =
+                self.chat.iter_mut().map(|i| &mut i.kind).find(|k| matches!(k, ChatKind::File { .. }))
+            {
+                *saved = true;
+            }
+        }
         if d.stream && !d.stream_started && !self.peers.is_empty() && crate::ffmpeg::path().is_some() {
             d.stream_started = true;
             self.node.start_stream(self.settings.clone());

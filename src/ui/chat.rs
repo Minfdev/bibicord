@@ -188,7 +188,8 @@ impl App {
         for path in dropped {
             self.send_file_path(&path);
         }
-        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+        let demo = std::env::var_os("BIBICORD_DEMO_DROP").is_some();
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) && !demo {
             return;
         }
         let screen = ctx.content_rect();
@@ -335,7 +336,9 @@ fn file_card(ui: &mut egui::Ui, file_name: &str, len: usize, saved: bool) -> boo
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(sp::M, 0.0);
                 ui.label(w::icon(ic::FILE, 30.0, c::TEXT_SECONDARY));
-                let button_w = 112.0;
+                // Narrow chat next to the voice stage: icon-only button.
+                let compact = ui.available_width() < 300.0;
+                let button_w = if compact { 34.0 } else { 112.0 };
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width() - button_w - sp::M);
                     ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
@@ -345,13 +348,13 @@ fn file_card(ui: &mut egui::Ui, file_name: &str, len: usize, saved: bool) -> boo
                 });
                 let (label, icon, kind) =
                     if saved { ("Zapisano", ic::CHECK, Kind::Success) } else { ("Zapisz", ic::DOWNLOAD_SIMPLE, Kind::Secondary) };
-                clicked = Button::new(label, kind)
-                    .icon(icon)
-                    .width(button_w)
-                    .height(34.0)
-                    .show(ui)
-                    .on_hover_text("Zapisz plik na dysku")
-                    .clicked();
+                let tip = if saved { "Zapisano, zapisz ponownie" } else { "Zapisz plik na dysku" };
+                clicked = if compact {
+                    let col = if saved { c::SUCCESS } else { c::TEXT_SECONDARY };
+                    IconButton::new(icon, tip).color(col).size(button_w).show(ui).clicked()
+                } else {
+                    Button::new(label, kind).icon(icon).width(button_w).height(34.0).show(ui).on_hover_text(tip).clicked()
+                };
             });
         });
     clicked
