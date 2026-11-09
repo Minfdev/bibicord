@@ -105,8 +105,9 @@ pobierane przy pierwszym uruchomieniu):
   uprawnienia administratora), skrót w menu Start, opcjonalnie na pulpicie,
   deinstalacja z „Aplikacje i funkcje”. Ponowne uruchomienie instalatora
   aktualizuje aplikację. Na macOS budowany krzyżowo (`brew install mingw-w64
-  makensis`, `rustup target add x86_64-pc-windows-gnu`).
+  makensis nasm cmake pkgconf`, `rustup target add x86_64-pc-windows-gnu`).
 * **macOS** – obraz DMG: otwórz i przeciągnij BibiCord do folderu Aplikacje.
+  FFmpeg buduje się ze źródeł (`brew install cmake pkgconf`).
 
 Oba skrypty wymagają `cargo-about` (`cargo install cargo-about --locked
 --features cli`): generuje licencje bibliotek do folderu `licenses`
@@ -114,7 +115,7 @@ w instalatorze (`scripts/licenses.sh`).
 
 Workflow `.github/workflows/release.yml` buduje oba instalatory przy każdym
 pushu; tag `v*` publikuje je jako release na GitHubie (`BibiCord-Setup.exe`,
-`BibiCord.dmg`, `SHA256SUMS.txt`).
+`BibiCord.dmg`, `SHA256SUMS.txt`, `ffmpeg-source.tar`).
 
 ### Wydanie nowej wersji
 
@@ -190,19 +191,26 @@ spoza listy `accepted` przerywa budowanie instalatora.
 
 ### FFmpeg
 
-Instalatory dołączają FFmpeg na licencji GPL v3. Buildy są przypięte
-w `packaging/ffmpeg.env` (adres, wersja, suma SHA-256):
+Instalatory dołączają FFmpeg zbudowany przez BibiCord ze źródeł
+(`scripts/build-ffmpeg.sh`, licencja GPL v3): FFmpeg z x264 i x265, a na
+Windows także z nagłówkami NVENC/NVDEC i AMF. Wersje i sumy SHA-256
+wszystkich źródeł są przypięte w `packaging/ffmpeg.env`. Włączone jest
+tylko to, czego używa BibiCord, bez bibliotek systemowych wykrywanych
+automatycznie:
 
-* Windows: [BtbN FFmpeg-Builds](https://github.com/FFmpeg-Builds/FFmpeg-Builds),
-  build miesięczny (przechowywany przez dwa lata),
-* macOS: [Martin Riedl](https://ffmpeg.martin-riedl.de), wydanie FFmpeg
-  ([skrypty budowania](https://git.martin-riedl.de/ffmpeg/build-script)).
+* Windows: budowany krzyżowo (mingw-w64), `ddagrab`, `dshow`,
+  D3D11VA/DXVA2, NVENC, AMF, Media Foundation,
+* macOS: Apple Silicon, macOS 14+, AVFoundation, VideoToolbox.
 
-W folderze `licenses` jest pełny tekst GPL v3 (`FFmpeg-GPL.txt`) oraz
-`FFmpeg-SOURCE.txt` z wersją i adresem kodu źródłowego. Każdy release
-zawiera źródła dołączonych wersji FFmpeg (`ffmpeg-source-windows.tar.gz`,
-`ffmpeg-source-macos.tar.xz`). Zmiana buildu: nowy adres, suma, wersja
-i źródło w `packaging/ffmpeg.env` naraz.
+`scripts/check-ffmpeg.sh` sprawdza, czy build ma wszystkie potrzebne
+elementy i czy działa kodowanie x264/x265. CI buduje FFmpeg tylko po
+zmianie `packaging/ffmpeg.env` lub skryptu (cache).
+
+W folderze `licenses` jest pełny tekst GPL v3 (`FFmpeg-GPL.txt`),
+licencje x264, x265 i nagłówków oraz `FFmpeg-SOURCE.txt` z wersjami.
+Każdy release zawiera `ffmpeg-source.tar` (`scripts/ffmpeg-source.sh`):
+niezmienione archiwa źródeł wszystkich składników i skrypty budowania.
+Zmiana wersji: nowy adres, wersja i suma w `packaging/ffmpeg.env` naraz.
 
 FFmpeg pobierany przez samą aplikację, gdy go brakuje (np. przy
 uruchomieniu z `cargo run`), pochodzi od dostawców `ffmpeg-sidecar`.

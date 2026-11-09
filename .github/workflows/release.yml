@@ -18,7 +18,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # FFmpeg for Windows, cross-compiled from source (scripts/build-ffmpeg.sh).
+  # Cached until packaging/ffmpeg.env or the build script changes.
+  ffmpeg-windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: target/pkg/ffmpeg/windows
+          key: ffmpeg-windows-${{ hashFiles('packaging/ffmpeg.env', 'scripts/build-ffmpeg.sh') }}
+      - name: Build FFmpeg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 nasm cmake pkg-config make
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+          scripts/build-ffmpeg.sh windows
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ffmpeg-windows
+          path: target/pkg/ffmpeg/windows
+
   windows:
+    needs: ffmpeg-windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -28,6 +53,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
+      - uses: actions/download-artifact@v5
+        with:
+          name: ffmpeg-windows
+          path: target/pkg/ffmpeg/windows
+      - name: Check FFmpeg
+        shell: bash
+        run: scripts/check-ffmpeg.sh target/pkg/ffmpeg/windows/ffmpeg.exe
       - name: Installer
         shell: bash
         env:
@@ -35,7 +67,7 @@ jobs:
         run: |
           export PATH="/c/Program Files (x86)/NSIS:$PATH"
           command -v makensis || choco install nsis -y --no-progress
-          scripts/build-windows-installer.sh
+          scripts/build-windows-installer.sh target/pkg/ffmpeg/windows/ffmpeg.exe
           cp dist/BibiCord-Setup-*.exe dist/BibiCord-Setup.exe
       - uses: actions/upload-artifact@v5
         with:
@@ -53,10 +85,22 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
+      - uses: actions/cache@v4
+        id: ffmpeg-cache
+        with:
+          path: target/pkg/ffmpeg/macos
+          key: ffmpeg-macos-${{ hashFiles('packaging/ffmpeg.env', 'scripts/build-ffmpeg.sh') }}
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          command -v pkg-config || brew install pkgconf
+          scripts/build-ffmpeg.sh macos
+      - name: Check FFmpeg
+        run: scripts/check-ffmpeg.sh target/pkg/ffmpeg/macos/ffmpeg
       - uses: astral-sh/setup-uv@v6
       - name: Installer
         run: |
-          scripts/build-macos-dmg.sh
+          scripts/build-macos-dmg.sh target/pkg/ffmpeg/macos/ffmpeg
           cp dist/BibiCord-*.dmg dist/BibiCord.dmg
       - uses: actions/upload-artifact@v5
         with:
@@ -73,16 +117,14 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
+          pattern: BibiCord-*
           path: dist
           merge-multiple: true
       - name: FFmpeg source (GPL)
-        run: |
-          . packaging/ffmpeg.env
-          scripts/fetch.sh "$FFMPEG_WIN_SOURCE_URL" "" dist/ffmpeg-source-windows.tar.gz
-          scripts/fetch.sh "$FFMPEG_MAC_SOURCE_URL" "$FFMPEG_MAC_SOURCE_SHA256" dist/ffmpeg-source-macos.tar.xz
+        run: scripts/ffmpeg-source.sh dist/ffmpeg-source.tar
       - name: Checksums and notes
         run: |
-          cd dist && sha256sum BibiCord-Setup.exe BibiCord.dmg ffmpeg-source-windows.tar.gz ffmpeg-source-macos.tar.xz > SHA256SUMS.txt && cd ..
+          cd dist && sha256sum BibiCord-Setup.exe BibiCord.dmg ffmpeg-source.tar > SHA256SUMS.txt && cd ..
           scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
       - uses: softprops/action-gh-release@v2
         with:
@@ -91,5 +133,4 @@ jobs:
             dist/BibiCord-Setup.exe
             dist/BibiCord.dmg
             dist/SHA256SUMS.txt
-            dist/ffmpeg-source-windows.tar.gz
-            dist/ffmpeg-source-macos.tar.xz
+            dist/ffmpeg-source.tar
