@@ -31,6 +31,8 @@ pub enum Event {
     PeerMute { id: EndpointId, muted: bool, deafened: bool },
     RoomName(String),
     Chat { from: Option<EndpointId>, name: String, text: String },
+    /// File posted in chat; `file_name` is already cleaned.
+    File { from: Option<EndpointId>, name: String, file_name: String, data: Arc<Vec<u8>> },
     MyStream(Option<StreamInfo>),
     MyCamera(bool),
     MyVoice(bool),
@@ -292,6 +294,22 @@ impl Node {
         self.emit(Event::Chat { from: None, name, text });
     }
 
+    /// Posts a file to everyone in the room; at most `MAX_FILE_BYTES`.
+    pub fn send_file(&self, file_name: &str, data: Vec<u8>) -> Result<()> {
+        if data.len() > proto::MAX_FILE_BYTES {
+            bail!("Plik jest za duży (maks. 1 MB)");
+        }
+        let file_name = proto::clean_file_name(file_name);
+        let s = self.0.state.lock().unwrap();
+        for p in s.peers.values() {
+            let _ = p.ctrl.send(Msg::File { name: file_name.clone(), data: data.clone() });
+        }
+        let name = s.name.clone();
+        drop(s);
+        self.emit(Event::File { from: None, name, file_name, data: Arc::new(data) });
+        Ok(())
+    }
+
     /// Sets the picture sent to peers we meet from now on (no broadcast).
     pub fn set_avatar(&self, avatar: Option<Vec<u8>>) {
         self.0.state.lock().unwrap().avatar = avatar;
@@ -493,6 +511,15 @@ impl Node {
                 Msg::Chat { text } => {
                     let name = self.peer_name(&remote);
                     self.emit(Event::Chat { from: Some(remote), name, text });
+                }
+                Msg::File { name: file_name, data } => {
+                    if data.len() > proto::MAX_FILE_BYTES {
+                        tracing::warn!("dropping {} B file from {remote}", data.len());
+                        continue;
+                    }
+                    let name = self.peer_name(&remote);
+                    let file_name = proto::clean_file_name(&file_name);
+                    self.emit(Event::File { from: Some(remote), name, file_name, data: Arc::new(data) });
                 }
                 Msg::Stream(info) => {
                     let stop_watch = {
@@ -1040,6 +1067,56 @@ mod tests {
         }
     }
 
+    /// Files in chat over the real network: everyone in the room gets the
+    /// exact bytes, too large files are refused by the sender and dropped by
+    /// the receiver without losing the connection.
+    /// Run with: cargo test e2e_file -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_file() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        let (c, crx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+            unreachable!()
+        };
+        b.join(&t, "Bob".into()).unwrap();
+        c.join(&t, "Cyryl".into()).unwrap();
+        wait_for(&brx, 30, |e| matches!(e, Event::PeerJoined { name, .. } if name == "Cyryl")).await;
+        wait_for(&crx, 30, |e| matches!(e, Event::PeerJoined { name, .. } if name == "Bob")).await;
+
+        let data: Vec<u8> = (0..proto::MAX_FILE_BYTES as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        b.send_file("../../raport.bin", data.clone()).unwrap();
+        for rx in [&arx, &crx] {
+            let Event::File { from, name, file_name, data: got } =
+                wait_for(rx, 20, |e| matches!(e, Event::File { .. })).await
+            else {
+                unreachable!()
+            };
+            assert_eq!((from, name.as_str(), file_name.as_str()), (b.my_id(), "Bob", "raport.bin"));
+            assert!(*got == data, "file bytes differ");
+        }
+        let Event::File { from: None, .. } = wait_for(&brx, 1, |e| matches!(e, Event::File { .. })).await else {
+            panic!("no local echo")
+        };
+
+        // Too large: refused by the sender.
+        assert!(b.send_file("big.bin", vec![0; proto::MAX_FILE_BYTES + 1]).is_err());
+
+        // Too large from a peer that skips the check: dropped, connection kept.
+        let ctrl = b.0.state.lock().unwrap().peers.get(&a.my_id().unwrap()).unwrap().ctrl.clone();
+        ctrl.send(Msg::File { name: "big.bin".into(), data: vec![0; proto::MAX_FILE_BYTES + 1] }).unwrap();
+        ctrl.send(Msg::File { name: "huge.bin".into(), data: vec![0; 2 << 20] }).unwrap();
+        b.send_chat("po pliku".into());
+        let e = wait_for(&arx, 20, |e| matches!(e, Event::File { .. } | Event::Chat { .. } | Event::PeerLeft { .. })).await;
+        assert!(matches!(&e, Event::Chat { text, .. } if text == "po pliku"), "{e:?}");
+        assert!(a.0.state.lock().unwrap().peers.contains_key(&b.my_id().unwrap()));
+        for n in [a, b, c] {
+            n.leave();
+        }
+    }
+
     /// Two peers over the real network: chat, then a test-pattern stream.
     /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg cargo test -- --ignored
     #[tokio::test(flavor = "multi_thread")]
@@ -1124,6 +1201,20 @@ mod tests {
             f.height
         );
         assert_eq!((f.width, f.height), (1920, 1080));
+
+        // Files both ways (1 MB each) don't interrupt the stream or voice.
+        let file: Vec<u8> = (0..proto::MAX_FILE_BYTES).map(|i| (i % 251) as u8).collect();
+        let frames = slot.count();
+        a.send_file("a.bin", file.clone()).unwrap();
+        b.send_file("b.bin", file.clone()).unwrap();
+        wait_for(&brx, 10, |e| matches!(e, Event::File { from: Some(_), data, .. } if **data == file)).await;
+        wait_for(&arx, 10, |e| matches!(e, Event::File { from: Some(_), data, .. } if **data == file)).await;
+        let t = Instant::now();
+        while slot.count() < frames + 60 {
+            assert!(t.elapsed() < Duration::from_secs(5), "stream stalled after file");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(b.watching().is_some());
 
         // Voice from A as heard by B (fake tone: 2 s on, 1.5 s off).
         tokio::time::sleep(Duration::from_secs(3)).await;

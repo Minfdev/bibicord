@@ -1,7 +1,7 @@
 # BibiCord
 
 Minimalistyczny komunikator dla znajomych w Ruście, inspirowany Discordem,
-**bez serwera**: czat tekstowy, głos i udostępnianie ekranu w jakości
+**bez serwera**: czat tekstowy (z plikami do 1 MB), głos i udostępnianie ekranu w jakości
 źródła. Działa na Windows 10, Windows 11 i macOS 14+.
 
 ## Pobierz
@@ -30,7 +30,8 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
 * **Komponenty** – `src/ui/widgets.rs`: przyciski, przyciski okrągłe, chipy,
   pola tekstowe, awatary z pierścieniem mówienia, odznaki NA ŻYWO, wiersze
   listy, menu, modale.
-* **Ekrany** – start, czat (wiadomości grupowane), scena głosowa z kafelkami
+* **Ekrany** – start, czat (wiadomości grupowane, pliki do 1 MB: spinacz lub
+  przeciągnięcie na okno, zapis przyciskiem „Zapisz”), scena głosowa z kafelkami
   16:9, oglądanie streamu z paskiem uczestników i czatem obok, okna
   „Udostępnij ekran”, „Zaproś” i „Ustawienia głosu”.
 
@@ -149,7 +150,7 @@ a przy głosie na **Mikrofon** (Ustawienia systemowe → Prywatność i ochrona)
 
 ```sh
 cargo test                       # testy jednostkowe
-cargo test -- --ignored          # end-to-end: 3 węzły przez prawdziwą sieć, czat + stream 1080p60
+cargo test -- --ignored          # end-to-end: 3 węzły przez prawdziwą sieć, czat, pliki + stream 1080p60
 ```
 
 Zmienne pomocnicze: `BIBICORD_TEST_SOURCE=1` streamuje obraz testowy zamiast

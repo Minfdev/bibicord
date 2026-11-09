@@ -32,6 +32,8 @@ pub(crate) struct PeerView {
 
 pub(crate) enum ChatKind {
     Message { from: Option<EndpointId>, name: String, text: String },
+    /// Kept in memory until the room is left; saved only on request.
+    File { from: Option<EndpointId>, name: String, file_name: String, data: Arc<Vec<u8>>, saved: bool },
     System { icon: &'static str, who: String, text: String, good: bool },
 }
 
@@ -367,16 +369,10 @@ impl App {
                     }
                 }
                 Event::Chat { from, name, text } => {
-                    if from.is_some() && !self.chat_visible() {
-                        self.unread += 1;
-                    }
-                    if from.is_some() && (!self.chat_visible() || !ctx.input(|i| i.focused)) {
-                        self.cue(Cue::Message);
-                    }
-                    self.chat.push(ChatItem {
-                        kind: ChatKind::Message { from, name, text },
-                        time: chrono::Local::now(),
-                    })
+                    self.incoming(ctx, from, ChatKind::Message { from, name, text });
+                }
+                Event::File { from, name, file_name, data } => {
+                    self.incoming(ctx, from, ChatKind::File { from, name, file_name, data, saved: false });
                 }
                 Event::MyStream(info) => {
                     self.stream_starting = false;
@@ -425,6 +421,17 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A chat message or file: unread badge and sound for other people's posts.
+    fn incoming(&mut self, ctx: &egui::Context, from: Option<EndpointId>, kind: ChatKind) {
+        if from.is_some() && !self.chat_visible() {
+            self.unread += 1;
+        }
+        if from.is_some() && (!self.chat_visible() || !ctx.input(|i| i.focused)) {
+            self.cue(crate::sounds::Cue::Message);
+        }
+        self.chat.push(ChatItem { kind, time: chrono::Local::now() });
     }
 
     pub(crate) fn enter_room(&mut self) {
@@ -585,6 +592,10 @@ impl App {
                 View::Voice => self.stage(ui),
                 View::Profile => self.profile_page(ui),
             });
+        // The profile page takes dropped pictures itself.
+        if self.view != View::Profile && self.dialog.is_none() {
+            self.file_drop(ui.ctx());
+        }
     }
 
     /// Checks for updates on start and every 6 hours (not in demo runs).
@@ -675,6 +686,9 @@ impl App {
             d.chat_sent = true;
             for line in d.chat.drain(..) {
                 self.node.send_chat(line);
+            }
+            for path in std::mem::take(&mut d.files) {
+                self.send_file_path(&path);
             }
         }
         if d.stream && !d.stream_started && !self.peers.is_empty() && crate::ffmpeg::path().is_some() {
