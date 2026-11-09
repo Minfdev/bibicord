@@ -31,11 +31,11 @@ if [ -z "$FF" ]; then
 fi
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/licenses"
+mkdir -p "$STAGE"
 cp "target/$TARGET/release/bibicord.exe" "$STAGE/"
 cp "$FF" "$STAGE/ffmpeg.exe"
 cp packaging/icon/icon.ico "$STAGE/"
-cp assets/fonts/Inter-LICENSE.txt "$STAGE/licenses/Inter-OFL.txt"
+scripts/licenses.sh "$STAGE/licenses" "$TARGET"
 if [ -f "$CACHE/FFmpeg-LICENSE.txt" ]; then
   cp "$CACHE/FFmpeg-LICENSE.txt" "$STAGE/licenses/FFmpeg-GPL.txt"
 else

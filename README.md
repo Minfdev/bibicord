@@ -108,6 +108,10 @@ pobierane przy pierwszym uruchomieniu):
   makensis`, `rustup target add x86_64-pc-windows-gnu`).
 * **macOS** – obraz DMG: otwórz i przeciągnij BibiCord do folderu Aplikacje.
 
+Oba skrypty wymagają `cargo-about` (`cargo install cargo-about --locked
+--features cli`): generuje licencje bibliotek do folderu `licenses`
+w instalatorze (`scripts/licenses.sh`).
+
 Workflow `.github/workflows/release.yml` buduje oba instalatory przy każdym
 pushu; tag `v*` publikuje je jako release na GitHubie (`BibiCord-Setup.exe`,
 `BibiCord.dmg`, `SHA256SUMS.txt`).
@@ -177,7 +181,12 @@ Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 BibiCord jest udostępniany na licencji MIT (`LICENSE`).
 
 Font Inter: SIL Open Font License 1.1 (`assets/fonts/Inter-LICENSE.txt`).
-Ikony Phosphor: MIT.
+Ikony Phosphor: MIT (`assets/fonts/Phosphor-LICENSE.txt`).
+
+Instalatory zawierają folder `licenses` z licencją BibiCord, fontów, FFmpeg
+oraz `THIRD-PARTY-LICENSES.html` z licencjami wszystkich bibliotek Rusta,
+generowanym przez `cargo-about` według `about.toml`. Biblioteka z licencją
+spoza listy `accepted` przerywa budowanie instalatora.
 
 ### FFmpeg
 

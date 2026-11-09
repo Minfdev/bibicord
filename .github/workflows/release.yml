@@ -25,6 +25,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
       - name: Installer
         shell: bash
         env:
@@ -47,6 +50,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
       - uses: astral-sh/setup-uv@v6
       - name: Installer
         run: |
