@@ -47,7 +47,8 @@ impl Binding {
     pub fn parse(s: &str) -> Option<Self> {
         let (kind, n) = s.trim().split_once(':')?;
         match kind {
-            "key" => n.parse().ok().map(Binding::Key),
+            // Tab moves keyboard focus; it cannot be the push-to-talk key.
+            "key" => n.parse().ok().filter(|k| *k != sys::TAB).map(Binding::Key),
             "mouse" => n.parse().ok().filter(|b| *b >= 3).map(Binding::Mouse),
             _ => None,
         }
@@ -193,27 +194,65 @@ impl Drop for Listener {
     }
 }
 
+/// Picks the key being captured from successive polls.
+///
+/// The first newly pressed key or mouse button wins (Escape cancels). A
+/// modifier (Shift, Ctrl, Alt, Windows/Command) is taken only when it is
+/// released on its own, so Shift+Tab used to move keyboard focus binds
+/// nothing. Tab itself is never bound.
+#[derive(Default)]
+struct Capturer {
+    /// Inputs down at the previous poll; `None` before the first one, so
+    /// keys already held when the capture started do not count.
+    before: Option<Vec<Binding>>,
+    pending: Option<Binding>,
+    /// Tab was pressed while `pending` was held.
+    spoiled: bool,
+}
+
+impl Capturer {
+    /// `down`: bindable inputs held now; `tab`: Tab held now. Returns the
+    /// result when the capture ends (`Some(None)` = cancelled).
+    fn step(&mut self, down: Vec<Binding>, tab: bool) -> Option<Option<Binding>> {
+        let before = self.before.replace(down.clone())?;
+        let pressed = down.iter().filter(|b| !before.contains(b)).copied();
+        let (mods, keys): (Vec<Binding>, Vec<Binding>) = pressed.partition(|b| sys::is_modifier(*b));
+        if let Some(b) = sys::pick(&keys) {
+            return Some((b != sys::CANCEL).then_some(b));
+        }
+        if !mods.is_empty() {
+            let all: Vec<Binding> = self.pending.into_iter().chain(mods).collect();
+            self.pending = sys::pick(&all);
+        }
+        // After the update: Shift and Tab may show up in the same poll.
+        if tab && self.pending.is_some() {
+            self.spoiled = true;
+        }
+        if let Some(p) = self.pending.filter(|p| !down.contains(p)) {
+            self.pending = None;
+            if !std::mem::take(&mut self.spoiled) {
+                return Some(Some(p));
+            }
+        }
+        None
+    }
+}
+
 fn run(inner: Arc<Inner>, stop: Arc<AtomicBool>) {
     let mut held = false;
-    // Inputs already down when the capture started (or at the last poll).
-    let mut down_before: Option<Vec<Binding>> = None;
+    let mut capturer = Capturer::default();
     while !stop.load(Ordering::Relaxed) {
         if *inner.capture.lock().unwrap() == Capture::Waiting {
             let down: Vec<Binding> = sys::candidates().filter(|b| sys::is_down(*b)).collect();
-            let new = down_before.as_ref().and_then(|before| {
-                let pressed: Vec<Binding> = down.iter().filter(|b| !before.contains(b)).copied().collect();
-                sys::pick(&pressed)
-            });
-            down_before = Some(down);
-            if let Some(b) = new {
+            if let Some(result) = capturer.step(down, sys::is_down(Binding::Key(sys::TAB))) {
                 let mut c = inner.capture.lock().unwrap();
                 if *c == Capture::Waiting {
-                    *c = Capture::Done((b != sys::CANCEL).then_some(b));
+                    *c = Capture::Done(result);
                 }
-                down_before = None;
+                capturer = Capturer::default();
             }
         } else {
-            down_before = None;
+            capturer = Capturer::default();
         }
 
         let now = inner.active.load(Ordering::Relaxed)
@@ -239,9 +278,15 @@ mod sys {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
     pub const CANCEL: Binding = Binding::Key(VK_ESCAPE);
+    pub const TAB: u16 = VK_TAB;
 
     pub fn has_permission() -> bool {
         true
+    }
+
+    /// Side-specific Shift, Ctrl, Alt and the Windows keys.
+    pub fn is_modifier(b: Binding) -> bool {
+        matches!(b, Binding::Key(VK_LSHIFT..=VK_RMENU | VK_LWIN | VK_RWIN))
     }
 
     pub fn request_permission() {}
@@ -277,9 +322,10 @@ mod sys {
     }
 
     /// Everything that can be bound: keys (side-specific modifiers instead
-    /// of the generic Shift/Ctrl/Alt) and the middle and side mouse buttons.
+    /// of the generic Shift/Ctrl/Alt; no Tab) and the middle and side mouse
+    /// buttons.
     pub fn candidates() -> impl Iterator<Item = Binding> {
-        let generic = [VK_SHIFT, VK_CONTROL, VK_MENU, VK_PACKET];
+        let generic = [VK_SHIFT, VK_CONTROL, VK_MENU, VK_PACKET, VK_TAB];
         (0x08u16..0xFF)
             .filter(move |vk| !generic.contains(vk))
             .map(Binding::Key)
@@ -361,6 +407,12 @@ mod sys {
     use super::Binding;
 
     pub const CANCEL: Binding = Binding::Key(0x35); // kVK_Escape
+    pub const TAB: u16 = 0x30; // kVK_Tab
+
+    /// Command, Shift, Option and Control (left and right).
+    pub fn is_modifier(b: Binding) -> bool {
+        matches!(b, Binding::Key(0x36..=0x38 | 0x3A..=0x3E))
+    }
 
     /// `kCGEventSourceStateHIDSystemState`: the hardware state, regardless
     /// of which app is in front.
@@ -405,9 +457,9 @@ mod sys {
         }
     }
 
-    /// All key codes and every mouse button except left and right.
+    /// All key codes except Tab and every mouse button except left and right.
     pub fn candidates() -> impl Iterator<Item = Binding> {
-        (0u16..0x80).map(Binding::Key).chain((3..=32).map(Binding::Mouse))
+        (0u16..0x80).filter(|k| *k != TAB).map(Binding::Key).chain((3..=32).map(Binding::Mouse))
     }
 
     pub fn pick(pressed: &[Binding]) -> Option<Binding> {
@@ -426,8 +478,13 @@ mod sys {
     use super::Binding;
 
     pub const CANCEL: Binding = Binding::Key(0);
+    pub const TAB: u16 = u16::MAX;
 
     pub fn has_permission() -> bool {
+        false
+    }
+
+    pub fn is_modifier(_: Binding) -> bool {
         false
     }
 
@@ -500,7 +557,7 @@ mod tests {
 
     #[test]
     fn binding_roundtrip() {
-        for b in [Binding::Key(0x56), Binding::Key(0), Binding::Mouse(3), Binding::Mouse(5), Binding::Mouse(9)] {
+        for b in [Binding::Key(0x56), Binding::Key(0x41), Binding::Mouse(3), Binding::Mouse(5), Binding::Mouse(9)] {
             assert_eq!(Binding::parse(&b.format()), Some(b));
             assert_eq!(Binding::decode(Binding::encode(Some(b))), Some(b));
         }
@@ -509,6 +566,7 @@ mod tests {
         assert_eq!(Binding::parse("mouse:1"), None);
         assert_eq!(Binding::parse("key:x"), None);
         assert_eq!(Binding::parse(""), None);
+        assert_eq!(Binding::parse(&Binding::Key(sys::TAB).format()), None);
     }
 
     #[test]
@@ -531,10 +589,55 @@ mod tests {
         // Candidates: no left/right mouse buttons, no generic modifiers.
         let all: Vec<_> = sys::candidates().collect();
         assert!(!all.contains(&Binding::Key(0x10)) && all.contains(&Binding::Key(0xA0)));
+        assert!(!all.contains(&Binding::Key(0x09)), "Tab cannot be bound");
         assert!(all.contains(&Binding::Mouse(4)) && !all.iter().any(|b| matches!(b, Binding::Key(1 | 2))));
         // AltGr = left Ctrl + right Alt at once: right Alt is bound.
         assert_eq!(sys::pick(&[Binding::Key(0xA2), Binding::Key(0xA5)]), Some(Binding::Key(0xA5)));
         assert_eq!(sys::pick(&[Binding::Key(0xA2)]), Some(Binding::Key(0xA2)));
         assert_eq!(sys::pick(&[]), None);
+    }
+
+    /// Runs polls `(inputs down, Tab down)` until the capture ends.
+    #[cfg(windows)]
+    fn capture(polls: &[(&[Binding], bool)]) -> Option<Option<Binding>> {
+        let mut c = Capturer::default();
+        polls.iter().find_map(|(down, tab)| c.step(down.to_vec(), *tab))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_rules() {
+        const V: Binding = Binding::Key(0x56);
+        const LSHIFT: Binding = Binding::Key(0xA0);
+        const LCTRL: Binding = Binding::Key(0xA2);
+        const RALT: Binding = Binding::Key(0xA5);
+        const ESC: Binding = Binding::Key(0x1B);
+        // A key binds as soon as it is pressed.
+        assert_eq!(capture(&[(&[], false), (&[V], false)]), Some(Some(V)));
+        assert_eq!(capture(&[(&[], false), (&[Binding::Mouse(4)], false)]), Some(Some(Binding::Mouse(4))));
+        // Escape cancels.
+        assert_eq!(capture(&[(&[], false), (&[ESC], false)]), Some(None));
+        // A key held when the capture starts counts only after release.
+        assert_eq!(capture(&[(&[V], false), (&[V], false), (&[], false)]), None);
+        assert_eq!(capture(&[(&[V], false), (&[], false), (&[V], false)]), Some(Some(V)));
+        // Tab alone binds nothing.
+        assert_eq!(capture(&[(&[], false), (&[], true), (&[], false)]), None);
+        // A modifier binds on release, when pressed alone.
+        assert_eq!(capture(&[(&[], false), (&[LSHIFT], false)]), None);
+        assert_eq!(capture(&[(&[], false), (&[LSHIFT], false), (&[], false)]), Some(Some(LSHIFT)));
+        // Shift+Tab (moving focus back) binds nothing; a later key does.
+        let shift_tab: &[(&[Binding], bool)] =
+            &[(&[], false), (&[LSHIFT], false), (&[LSHIFT], true), (&[LSHIFT], false), (&[], false)];
+        assert_eq!(capture(shift_tab), None);
+        // Shift and Tab first seen in the same poll.
+        assert_eq!(capture(&[(&[], false), (&[LSHIFT], true), (&[], false)]), None);
+        let mut then_v = shift_tab.to_vec();
+        then_v.push((&[V], false));
+        assert_eq!(capture(&then_v), Some(Some(V)));
+        // Modifier + key: the key is bound (no combinations).
+        assert_eq!(capture(&[(&[], false), (&[LSHIFT], false), (&[LSHIFT, V], false)]), Some(Some(V)));
+        // AltGr (left Ctrl + right Alt), even a poll apart: right Alt.
+        assert_eq!(capture(&[(&[], false), (&[LCTRL, RALT], false), (&[], false)]), Some(Some(RALT)));
+        assert_eq!(capture(&[(&[], false), (&[LCTRL], false), (&[LCTRL, RALT], false), (&[], false)]), Some(Some(RALT)));
     }
 }

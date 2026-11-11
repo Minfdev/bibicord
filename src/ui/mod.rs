@@ -127,8 +127,8 @@ pub struct App {
     /// Gain of the push-to-talk cue (`f32` bits), 0 = silent. Read on the
     /// poller thread, which cannot see `App`.
     ptt_gain: Arc<std::sync::atomic::AtomicU32>,
-    /// Push-to-talk was active last frame (for the permission warning).
-    ptt_was_active: bool,
+    /// The missing key / permission warning was handled for this call.
+    ptt_warned: bool,
     /// The key field was on screen last frame (a capture is cancelled when
     /// the settings close).
     pub(crate) ptt_field_shown: bool,
@@ -231,7 +231,7 @@ impl App {
             sounds,
             ptt,
             ptt_gain,
-            ptt_was_active: false,
+            ptt_warned: false,
             ptt_field_shown: false,
             update_checked: None,
             demo: crate::demo::Demo::from_env(),
@@ -501,10 +501,10 @@ impl App {
     fn sync_ptt(&mut self, ctx: &egui::Context) {
         use crate::voice::Mode;
         let mut prefs = self.node.voice_prefs();
-        if self.ptt.capturing() && !self.ptt_field_shown {
+        let field_shown = std::mem::take(&mut self.ptt_field_shown);
+        if self.ptt.capturing() && !field_shown {
             self.ptt.cancel_capture();
         }
-        self.ptt_field_shown = false;
         if let Some(Some(key)) = self.ptt.take_captured() {
             prefs.ptt_key = Some(key);
             self.node.set_voice_prefs(prefs);
@@ -520,7 +520,13 @@ impl App {
         let gain = if audible { self.sounds.gain() } else { 0.0 };
         self.ptt_gain.store(gain.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
-        if active && !self.ptt_was_active {
+        // Warn once per call, but not while the push-to-talk settings are on
+        // screen: they already show what is missing. Closing them without a
+        // key still warns.
+        if !active {
+            self.ptt_warned = false;
+        } else if !self.ptt_warned && !field_shown {
+            self.ptt_warned = true;
             if prefs.ptt_key.is_none() {
                 self.error = Some(("Naciśnij, aby mówić: ustaw klawisz w ustawieniach głosu.".into(), Instant::now()));
             } else if !crate::ptt::has_permission() {
@@ -530,7 +536,6 @@ impl App {
                 ));
             }
         }
-        self.ptt_was_active = active;
     }
 
     pub(crate) fn join_voice(&mut self) {

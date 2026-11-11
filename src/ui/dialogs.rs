@@ -525,7 +525,7 @@ impl App {
         });
         if capturing {
             ui.label(w::text(
-                "Naciśnij klawisz albo środkowy lub boczny przycisk myszy. Esc anuluje.",
+                "Naciśnij klawisz (poza Tab) albo środkowy lub boczny przycisk myszy. Esc anuluje.",
                 ty::SMALL,
                 c::TEXT_MUTED,
             ));
