@@ -1231,20 +1231,22 @@ mod tests {
         b.leave();
     }
 
-    /// Real screen capture that survives losing it: while it runs, switch a
-    /// game to fullscreen, Alt+Tab, change the display resolution or open UAC.
-    /// The stream must not end and frames must keep coming.
-    /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg BIBICORD_TEST_SECS=60 \
-    ///   cargo test e2e_screen_capture_loss -- --ignored --nocapture
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
-    async fn e2e_screen_capture_loss() {
+    /// Two nodes, A streams its real screen to B. Settings from the
+    /// environment: BIBICORD_TEST_CODEC=hevc, BIBICORD_TEST_MAX_HEIGHT=720.
+    async fn screen_stream() -> (Node, std::sync::mpsc::Receiver<Event>, Node, std::sync::mpsc::Receiver<Event>) {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
         unsafe {
             std::env::set_var("BIBICORD_FAKE_AUDIO", "1");
         }
         tokio::task::spawn_blocking(|| crate::ffmpeg::ensure(|_| {})).await.unwrap().unwrap();
-        let secs = std::env::var("BIBICORD_TEST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let env = |k: &str| std::env::var(k).ok();
+        let settings = video::encode::Settings {
+            codec: if env("BIBICORD_TEST_CODEC").as_deref() == Some("hevc") { proto::Codec::Hevc } else { proto::Codec::H264 },
+            max_height: env("BIBICORD_TEST_MAX_HEIGHT").and_then(|s| s.parse().ok()).unwrap_or(0),
+            fps: 30,
+            bitrate_kbps: 8_000,
+            ..Default::default()
+        };
 
         let (a, arx) = node();
         let (b, brx) = node();
@@ -1254,9 +1256,9 @@ mod tests {
         };
         b.join(&t, "Bob".into()).unwrap();
         wait_for(&brx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
-        a.start_stream(video::encode::Settings { fps: 30, bitrate_kbps: 8_000, ..Default::default() });
+        a.start_stream(settings);
         let Event::MyStream(Some(info)) =
-            wait_for(&arx, 60, |e| matches!(e, Event::MyStream(_) | Event::Error(_))).await
+            wait_for(&arx, 90, |e| matches!(e, Event::MyStream(_) | Event::Error(_))).await
         else {
             panic!("stream failed to start")
         };
@@ -1267,7 +1269,19 @@ mod tests {
             unreachable!()
         };
         b.watch(id);
+        (a, arx, b, brx)
+    }
 
+    /// Real screen capture that survives losing it: while it runs, switch a
+    /// game to fullscreen, Alt+Tab, change the display resolution or open UAC.
+    /// The stream must not end and frames must keep coming.
+    /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg BIBICORD_TEST_SECS=60 \
+    ///   cargo test e2e_screen_capture_loss -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_screen_capture_loss() {
+        let secs = std::env::var("BIBICORD_TEST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let (a, arx, b, _brx) = screen_stream().await;
         println!(">>> {secs} s: go fullscreen / change resolution now");
         let slot = b.frames();
         let start = Instant::now();
@@ -1287,15 +1301,44 @@ mod tests {
             }
             if slot.count() != count {
                 count = slot.count();
-                longest_gap = longest_gap.max(last_frame.elapsed());
+                let gap = last_frame.elapsed();
+                if gap > Duration::from_millis(300) {
+                    println!("{:>5.1} s: no picture for {:.2} s", start.elapsed().as_secs_f32(), gap.as_secs_f32());
+                }
+                longest_gap = longest_gap.max(gap);
                 last_frame = Instant::now();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         println!("{count} frames, longest gap {longest_gap:?}");
-        assert!(last_frame.elapsed() < Duration::from_secs(2), "no frames at the end");
+        // BIBICORD_TEST_STOP_WHILE_LOST=1: the screen is still gone at the
+        // end, the stream is stopped in the middle of recovering it.
+        let lost_at_end = std::env::var_os("BIBICORD_TEST_STOP_WHILE_LOST").is_some();
+        assert_eq!(last_frame.elapsed() > Duration::from_secs(2), lost_at_end, "frames at the end");
         assert!(b.watching().is_some());
         a.stop_stream();
+        a.leave();
+        b.leave();
+    }
+
+    /// Screen capture that doesn't come back (here: another desktop shown
+    /// for longer than the recovery window) ends the stream with a message
+    /// instead of restarting forever.
+    /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg \
+    ///   cargo test e2e_screen_capture_gone -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_screen_capture_gone() {
+        let (a, arx, b, brx) = screen_stream().await;
+        println!(">>> take the screen away for good now");
+        let start = Instant::now();
+        let Event::Error(msg) = wait_for(&arx, 120, |e| matches!(e, Event::Error(_))).await else {
+            unreachable!()
+        };
+        println!("{:>5.1} s: {msg}", start.elapsed().as_secs_f32());
+        assert!(msg.contains("nie udało się wznowić przechwytywania ekranu"), "{msg}");
+        assert!(a.0.state.lock().unwrap().broadcast.is_none());
+        wait_for(&brx, 10, |e| matches!(e, Event::Watching(None))).await;
         a.leave();
         b.leave();
     }
