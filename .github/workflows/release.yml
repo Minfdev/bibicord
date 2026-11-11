@@ -62,10 +62,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Release + the installer's --target: dependencies compile once and the
-      # installer build below only rebuilds bibicord.
-      - run: cargo test --release --target $TARGET
-        shell: bash
+      # Debug: with LTO the release test binary takes ~3 min to link.
+      - run: cargo test
       - uses: taiki-e/install-action@v2
         if: env.INSTALLERS == 'true'
         with:
@@ -102,8 +100,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Release: dependencies compile once, shared with the installer build.
-      - run: cargo test --release
+      - run: cargo test
       - uses: taiki-e/install-action@v2
         if: env.INSTALLERS == 'true'
         with:
