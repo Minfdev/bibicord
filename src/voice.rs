@@ -44,8 +44,12 @@ const MAX_CONCEAL: u32 = 3;
 const VAD_MIN: f32 = 0.0016;
 const VAD_OVER_FLOOR: f32 = 2.5;
 const HANGOVER: u32 = 50;
-/// Frames sent from before the gate opened (soft word onsets).
+/// Frames sent from before the gate opened (soft word onsets). Not used in
+/// push-to-talk: the gate follows the key, not the voice.
 const PREROLL: usize = 2;
+/// Push-to-talk release delay bounds and default, in ms.
+pub const PTT_RELEASE_MAX: u32 = 1000;
+const PTT_RELEASE_DEFAULT: u32 = 200;
 
 const FLAG_SPEAKING: u8 = 1;
 const FLAG_END: u8 = 2;
@@ -62,6 +66,11 @@ struct Shared {
     noise_suppression: AtomicBool,
     /// Manual voice-activation threshold in dBFS, or `AUTO`.
     sensitivity: AtomicI32,
+    /// Push-to-talk: the gate opens while `ptt_held` is set instead of on voice.
+    ptt: AtomicBool,
+    /// Frames the gate stays open after the key is released.
+    ptt_release: AtomicU32,
+    ptt_held: &'static AtomicBool,
     /// Last microphone frame level in dBFS (`f32` bits), after suppression.
     mic_level: AtomicU32,
     out_rate: Mutex<u32>,
@@ -78,6 +87,9 @@ impl Shared {
             deafened: AtomicBool::new(deafened),
             noise_suppression: AtomicBool::new(false),
             sensitivity: AtomicI32::new(AUTO),
+            ptt: AtomicBool::new(false),
+            ptt_release: AtomicU32::new(0),
+            ptt_held: &crate::ptt::HELD,
             mic_level: AtomicU32::new((-100f32).to_bits()),
             out_rate: Mutex::new(RATE),
             peers: Mutex::new(HashMap::new()),
@@ -90,6 +102,8 @@ impl Shared {
     fn set_prefs(&self, p: Prefs) {
         self.noise_suppression.store(p.noise_suppression, Ordering::Relaxed);
         self.sensitivity.store(p.sensitivity.unwrap_or(AUTO), Ordering::Relaxed);
+        self.ptt.store(p.mode == Mode::PushToTalk, Ordering::Relaxed);
+        self.ptt_release.store(p.ptt_release_ms.div_ceil(20), Ordering::Relaxed);
     }
 }
 
@@ -466,17 +480,39 @@ pub struct Devices {
     pub output: Option<String>,
 }
 
+/// When the microphone transmits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// When the level crosses the threshold (`Prefs::sensitivity`).
+    Voice,
+    /// While the push-to-talk key is held.
+    PushToTalk,
+}
+
 /// Microphone processing preferences.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Prefs {
     pub noise_suppression: bool,
     /// Voice-activation threshold in dBFS; `None` = automatic (adaptive).
     pub sensitivity: Option<i32>,
+    pub mode: Mode,
+    pub ptt_key: Option<crate::ptt::Binding>,
+    /// How long the microphone stays on after the key is released.
+    pub ptt_release_ms: u32,
+    /// Short sound when the key is pressed and released.
+    pub ptt_sounds: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { noise_suppression: true, sensitivity: None }
+        Prefs {
+            noise_suppression: true,
+            sensitivity: None,
+            mode: Mode::Voice,
+            ptt_key: None,
+            ptt_release_ms: PTT_RELEASE_DEFAULT,
+            ptt_sounds: true,
+        }
     }
 }
 
@@ -497,6 +533,12 @@ impl Prefs {
                 Some(("sensitivity", v)) => {
                     p.sensitivity = v.parse::<i32>().ok().map(|d| d.clamp(crate::mic::DB_MIN, crate::mic::DB_MAX))
                 }
+                Some(("mode", v)) => p.mode = if v == "ptt" { Mode::PushToTalk } else { Mode::Voice },
+                Some(("ptt_key", v)) => p.ptt_key = crate::ptt::Binding::parse(v),
+                Some(("ptt_release_ms", v)) => {
+                    p.ptt_release_ms = v.parse::<u32>().map_or(PTT_RELEASE_DEFAULT, |ms| ms.min(PTT_RELEASE_MAX))
+                }
+                Some(("ptt_sounds", v)) => p.ptt_sounds = v != "0",
                 _ => {}
             }
         }
@@ -505,7 +547,15 @@ impl Prefs {
 
     fn format(&self) -> String {
         let sens = self.sensitivity.map_or("auto".to_string(), |d| d.to_string());
-        format!("noise_suppression={}\nsensitivity={sens}\n", self.noise_suppression as u8)
+        let mode = match self.mode {
+            Mode::Voice => "voice",
+            Mode::PushToTalk => "ptt",
+        };
+        let key = self.ptt_key.map_or("none".to_string(), |k| k.format());
+        format!(
+            "noise_suppression={}\nsensitivity={sens}\nmode={mode}\nptt_key={key}\nptt_release_ms={}\nptt_sounds={}\n",
+            self.noise_suppression as u8, self.ptt_release_ms, self.ptt_sounds as u8
+        )
     }
 
     pub fn save(&self) {
@@ -562,6 +612,7 @@ fn capture_pipeline(
     let mut seq: u16 = 0;
     let mut floor = VAD_MIN;
     let mut hang = 0u32;
+    let mut was_ptt = false;
     // Encoded but unsent frames, replayed when the gate opens.
     let mut preroll: VecDeque<Bytes> = VecDeque::with_capacity(PREROLL + 1);
     let mut denoise = crate::mic::Denoise::new();
@@ -584,31 +635,51 @@ fn capture_pipeline(
                 AUTO => level > VAD_MIN && level > floor * VAD_OVER_FLOOR,
                 threshold => level_db >= threshold as f32,
             };
+            // Mute wins over everything, push-to-talk included.
             if shared.muted.load(Ordering::Relaxed) {
                 hang = 0;
                 preroll.clear();
                 continue;
             }
+            let ptt = shared.ptt.load(Ordering::Relaxed);
+            if ptt != was_ptt {
+                // Mode switched mid-call: close an open spurt now instead of
+                // running out the other mode's hangover, and drop pre-roll
+                // recorded under the old mode (it predates the key press).
+                was_ptt = ptt;
+                hang = hang.min(1);
+                preroll.clear();
+            }
             let was_open = hang > 0;
-            if voiced {
-                hang = HANGOVER;
-                *shared.me_speaking_until.lock().unwrap() = Instant::now() + Duration::from_millis(250);
+            let opens = if ptt { shared.ptt_held.load(Ordering::Relaxed) } else { voiced };
+            if opens {
+                hang = if ptt { 1 + shared.ptt_release.load(Ordering::Relaxed) } else { HANGOVER };
             } else if hang > 0 {
                 hang -= 1;
+            }
+            // "Speaking" means voice, not just an open gate (a held key
+            // with silence does not light the ring).
+            let speaking = voiced && hang > 0;
+            if speaking {
+                *shared.me_speaking_until.lock().unwrap() = Instant::now() + Duration::from_millis(250);
             }
             // Always encode, so the encoder state (and FEC) stays continuous.
             let mut out = [0u8; 1500];
             out[0..2].copy_from_slice(&this.to_le_bytes());
-            out[2] = if voiced { FLAG_SPEAKING } else { 0 };
+            out[2] = if speaking { FLAG_SPEAKING } else { 0 };
             if hang == 0 && was_open {
                 out[2] |= FLAG_END;
             }
             let Ok(n) = enc.encode_float(&frame, &mut out[3..]) else { continue };
             let pkt = Bytes::copy_from_slice(&out[..n + 3]);
             if hang == 0 && !was_open {
-                preroll.push_back(pkt);
-                if preroll.len() > PREROLL {
-                    preroll.pop_front();
+                if ptt {
+                    preroll.clear();
+                } else {
+                    preroll.push_back(pkt);
+                    if preroll.len() > PREROLL {
+                        preroll.pop_front();
+                    }
                 }
                 continue;
             }
@@ -846,7 +917,7 @@ pub(crate) mod sim {
 
     pub fn run(net: &Net, secs: f64) -> Report {
         // Network simulation: the synthetic tone is not run through RNNoise.
-        let shared = |_| Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, sensitivity: None }));
+        let shared = |_| Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, ..Prefs::default() }));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut capture = capture_pipeline(shared(0), tx, RATE).unwrap();
         let rx_voice = Voice { shared: shared(1), stop: Arc::new(AtomicBool::new(false)) };
@@ -1002,11 +1073,126 @@ mod tests {
     #[test]
     fn prefs_roundtrip() {
         assert_eq!(Prefs::parse(""), Prefs::default());
-        for p in [Prefs::default(), Prefs { noise_suppression: false, sensitivity: Some(-42) }] {
+        let ptt = Prefs {
+            noise_suppression: false,
+            sensitivity: Some(-42),
+            mode: Mode::PushToTalk,
+            ptt_key: Some(crate::ptt::Binding::Mouse(4)),
+            ptt_release_ms: 0,
+            ptt_sounds: false,
+        };
+        for p in [Prefs::default(), ptt, Prefs { ptt_key: Some(crate::ptt::Binding::Key(0x56)), ..ptt }] {
             assert_eq!(Prefs::parse(&p.format()), p);
         }
         assert_eq!(Prefs::parse("sensitivity=-200").sensitivity, Some(crate::mic::DB_MIN));
         assert_eq!(Prefs::parse("sensitivity=auto").sensitivity, None);
+        // Files from older versions: voice activation, as before.
+        let old = Prefs::parse("noise_suppression=1\nsensitivity=auto\n");
+        assert_eq!((old.mode, old.ptt_key, old.ptt_release_ms), (Mode::Voice, None, 200));
+        assert_eq!(Prefs::parse("ptt_release_ms=99999").ptt_release_ms, PTT_RELEASE_MAX);
+    }
+
+    /// Feeds 20 ms frames, `(key held, -30 dBFS tone, muted)` each, and
+    /// returns the flags of the packet sent for every frame (`None` = not sent).
+    fn ptt_run(prefs: Prefs, script: &[(bool, bool, bool)]) -> Vec<Option<u8>> {
+        let held: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let mut sh = Shared::new(false, false, prefs);
+        sh.ptt_held = held;
+        let shared = Arc::new(sh);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        let mut capture = capture_pipeline(shared.clone(), tx, RATE).unwrap();
+        script
+            .iter()
+            .enumerate()
+            .map(|(k, &(down, tone, muted))| {
+                held.store(down, Ordering::Relaxed);
+                shared.muted.store(muted, Ordering::Relaxed);
+                let a = if tone { 0.0447 } else { 0.0 };
+                let frame: Vec<f32> = (0..FRAME)
+                    .map(|i| a * ((k * FRAME + i) as f32 / RATE as f32 * 2.0 * std::f32::consts::PI * 220.0).sin())
+                    .collect();
+                capture(&frame);
+                let pkts: Vec<Bytes> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                assert!(pkts.len() <= 1, "frame {k}: no pre-roll burst expected");
+                pkts.first().map(|p| {
+                    assert_eq!(u16::from_le_bytes([p[0], p[1]]), k as u16);
+                    p[2]
+                })
+            })
+            .collect()
+    }
+
+    fn ptt_prefs(release_ms: u32) -> Prefs {
+        Prefs {
+            noise_suppression: false,
+            sensitivity: Some(-40),
+            mode: Mode::PushToTalk,
+            ptt_key: Some(crate::ptt::Binding::Key(0x56)),
+            ptt_release_ms: release_ms,
+            ptt_sounds: false,
+        }
+    }
+
+    /// Push-to-talk: loud speech without the key is not sent; with the key
+    /// it is, including the release delay; mute wins over the key.
+    #[test]
+    fn push_to_talk_gates_on_key() {
+        // 10 frames talking without the key, 10 with it, then release.
+        let mut script = vec![(false, true, false); 10];
+        script.extend(vec![(true, true, false); 10]);
+        script.extend(vec![(false, true, false); 20]);
+        let out = ptt_run(ptt_prefs(200), &script);
+        assert!(out[..10].iter().all(Option::is_none), "{out:?}");
+        assert!(out[10..20].iter().all(|f| f.is_some_and(|f| f & FLAG_SPEAKING != 0)), "{out:?}");
+        // 200 ms = 10 frames after release, then the end-of-spurt frame.
+        assert!(out[20..30].iter().all(|f| f.is_some_and(|f| f & FLAG_END == 0)), "{out:?}");
+        assert_eq!(out[30].map(|f| f & FLAG_END), Some(FLAG_END), "{out:?}");
+        assert!(out[31..].iter().all(Option::is_none), "{out:?}");
+
+        // No delay: the frame after the release closes the spurt.
+        let out = ptt_run(ptt_prefs(0), &[(true, true, false), (false, true, false), (false, true, false)]);
+        assert_eq!(out[0].map(|f| f & FLAG_END), Some(0));
+        assert_eq!(out[1].map(|f| f & FLAG_END), Some(FLAG_END));
+        assert_eq!(out[2], None);
+
+        // Held key with silence: sent (the gate is open) but not "speaking".
+        let out = ptt_run(ptt_prefs(0), &[(true, false, false); 5]);
+        assert!(out.iter().all(|f| *f == Some(0)), "{out:?}");
+
+        // Muted: the key does nothing.
+        let out = ptt_run(ptt_prefs(200), &[(true, true, true); 5]);
+        assert!(out.iter().all(Option::is_none), "{out:?}");
+    }
+
+    /// Switching voice activation -> push-to-talk with the key already held
+    /// sends no pre-roll recorded before the switch.
+    #[test]
+    fn mode_switch_drops_preroll() {
+        let held: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
+        let mut sh = Shared::new(false, false, Prefs { mode: Mode::Voice, ..ptt_prefs(0) });
+        sh.ptt_held = held;
+        let shared = Arc::new(sh);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        let mut capture = capture_pipeline(shared.clone(), tx, RATE).unwrap();
+        // Silence under voice activation fills the pre-roll, nothing is sent.
+        for _ in 0..5 {
+            capture(&[0.0; FRAME]);
+        }
+        assert!(rx.try_recv().is_err());
+        shared.set_prefs(ptt_prefs(0));
+        capture(&[0.0; FRAME]);
+        let pkts: Vec<Bytes> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0][2] & FLAG_PREROLL, 0);
+    }
+
+    /// Voice activation ignores the push-to-talk key.
+    #[test]
+    fn voice_mode_ignores_key() {
+        let p = Prefs { mode: Mode::Voice, ..ptt_prefs(0) };
+        assert!(ptt_run(p, &[(true, false, false); 5]).iter().all(Option::is_none));
+        let out = ptt_run(p, &[(false, true, false); 5]);
+        assert!(out.iter().all(|f| f.is_some_and(|f| f & FLAG_SPEAKING != 0)), "{out:?}");
     }
 
     /// A manual threshold gates on level alone: -30 dBFS speech passes a
@@ -1014,7 +1200,11 @@ mod tests {
     #[test]
     fn manual_threshold_gates() {
         let sent = |threshold| {
-            let shared = Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, sensitivity: Some(threshold) }));
+            let shared = Arc::new(Shared::new(
+                false,
+                false,
+                Prefs { noise_suppression: false, sensitivity: Some(threshold), ..Prefs::default() },
+            ));
             let (tx, mut rx) = mpsc::unbounded_channel();
             let mut capture = capture_pipeline(shared.clone(), tx, RATE).unwrap();
             for k in 0..50 {

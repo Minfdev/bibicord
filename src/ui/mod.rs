@@ -122,6 +122,16 @@ pub struct App {
     pub(crate) error: Option<(String, Instant)>,
     pub(crate) update: crate::update::Shared,
     pub(crate) sounds: crate::sounds::Player,
+    /// Global push-to-talk key poller.
+    pub(crate) ptt: crate::ptt::Listener,
+    /// Gain of the push-to-talk cue (`f32` bits), 0 = silent. Read on the
+    /// poller thread, which cannot see `App`.
+    ptt_gain: Arc<std::sync::atomic::AtomicU32>,
+    /// Push-to-talk was active last frame (for the permission warning).
+    ptt_was_active: bool,
+    /// The key field was on screen last frame (a capture is cancelled when
+    /// the settings close).
+    pub(crate) ptt_field_shown: bool,
     update_checked: Option<Instant>,
     demo: Option<crate::demo::Demo>,
 }
@@ -160,6 +170,17 @@ impl App {
         let my_avatar = crate::avatar::load();
         let my_avatar_tex = my_avatar.as_deref().and_then(|png| profile::texture(&cc.egui_ctx, "me", png));
         node.set_avatar(my_avatar.clone());
+
+        let sounds = crate::sounds::Player::new();
+        let ptt_gain = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ptt = {
+            let (node, remote, gain) = (node.clone(), sounds.remote(), ptt_gain.clone());
+            crate::ptt::Listener::new(move |down| {
+                let gain = f32::from_bits(gain.load(std::sync::atomic::Ordering::Relaxed));
+                let cue = if down { crate::sounds::Cue::PttOn } else { crate::sounds::Cue::PttOff };
+                remote.play(cue, gain, node.devices().output);
+            })
+        };
 
         App {
             node,
@@ -207,7 +228,11 @@ impl App {
             status: String::new(),
             error: None,
             update: Default::default(),
-            sounds: crate::sounds::Player::new(),
+            sounds,
+            ptt,
+            ptt_gain,
+            ptt_was_active: false,
+            ptt_field_shown: false,
             update_checked: None,
             demo: crate::demo::Demo::from_env(),
         }
@@ -469,6 +494,43 @@ impl App {
             self.fullscreen = false;
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
         }
+    }
+
+    /// Keeps the push-to-talk poller in step with the settings and the
+    /// call; applies a newly captured key.
+    fn sync_ptt(&mut self, ctx: &egui::Context) {
+        use crate::voice::Mode;
+        let mut prefs = self.node.voice_prefs();
+        if self.ptt.capturing() && !self.ptt_field_shown {
+            self.ptt.cancel_capture();
+        }
+        self.ptt_field_shown = false;
+        if let Some(Some(key)) = self.ptt.take_captured() {
+            prefs.ptt_key = Some(key);
+            self.node.set_voice_prefs(prefs);
+            prefs.save();
+        }
+        let active = self.my_voice && prefs.mode == Mode::PushToTalk;
+        self.ptt.sync(prefs.ptt_key, active);
+        if self.ptt.capturing() {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+
+        let audible = active && prefs.ptt_sounds && !self.mute.muted && !self.mute.deafened;
+        let gain = if audible { self.sounds.gain() } else { 0.0 };
+        self.ptt_gain.store(gain.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+        if active && !self.ptt_was_active {
+            if prefs.ptt_key.is_none() {
+                self.error = Some(("Naciśnij, aby mówić: ustaw klawisz w ustawieniach głosu.".into(), Instant::now()));
+            } else if !crate::ptt::has_permission() {
+                self.error = Some((
+                    "Naciśnij, aby mówić: brak zgody na monitorowanie wprowadzania. Zobacz ustawienia głosu.".into(),
+                    Instant::now(),
+                ));
+            }
+        }
+        self.ptt_was_active = active;
     }
 
     pub(crate) fn join_voice(&mut self) {
@@ -747,6 +809,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_events(&ctx);
+        self.sync_ptt(&ctx);
         self.run_demo(&ctx);
         self.poll_update(&ctx);
         if self.chat_visible() {

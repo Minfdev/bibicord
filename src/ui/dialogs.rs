@@ -333,6 +333,19 @@ impl App {
         if header(ui, "Ustawienia głosu", "Mikrofon, głośniki i kamera używane w rozmowie.") {
             self.dialog = None;
         }
+        // Tall with push-to-talk options: scroll inside the window.
+        let max_h = (ui.ctx().content_rect().height() - 220.0).max(200.0);
+        egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+            self.settings_body(ui);
+        });
+        footer(ui, |ui| {
+            if Button::new("Gotowe", Kind::Primary).show(ui).clicked() {
+                self.dialog = None;
+            }
+        });
+    }
+
+    fn settings_body(&mut self, ui: &mut Ui) {
         body(ui, |ui| {
             self.audio_settings(ui);
             ui.add_space(sp::L);
@@ -376,11 +389,6 @@ impl App {
                 self.open_profile();
             }
         });
-        footer(ui, |ui| {
-            if Button::new("Gotowe", Kind::Primary).show(ui).clicked() {
-                self.dialog = None;
-            }
-        });
     }
 
     /// Devices, microphone processing and notification sounds. Works without
@@ -406,11 +414,36 @@ impl App {
         }
     }
 
-    /// Microphone processing: noise suppression and sensitivity (dBFS) with a live level meter.
+    /// Microphone: input mode (voice activation / push-to-talk), noise
+    /// suppression and sensitivity (dBFS) with a live level meter.
     fn mic_ui(&mut self, ui: &mut Ui) {
         use crate::mic::{DB_MAX, DB_MIN};
+        use crate::voice::Mode;
         let before = self.node.voice_prefs();
         let mut p = before;
+        w::field_label(ui, "Tryb wejścia");
+        ui.horizontal(|ui| {
+            if w::chip(ui, "Aktywacja głosem", p.mode == Mode::Voice).clicked() {
+                p.mode = Mode::Voice;
+                self.ptt.cancel_capture();
+            }
+            if w::chip(ui, "Naciśnij, aby mówić", p.mode == Mode::PushToTalk).clicked() && p.mode != Mode::PushToTalk {
+                p.mode = Mode::PushToTalk;
+                // macOS: the system prompt for Input Monitoring (once).
+                if !crate::ptt::has_permission() {
+                    crate::ptt::request_permission();
+                }
+                if p.ptt_key.is_none() {
+                    self.ptt.start_capture();
+                }
+            }
+        });
+        if p.mode == Mode::PushToTalk {
+            ui.add_space(sp::M);
+            self.ptt_ui(ui, &mut p);
+        }
+        ui.add_space(sp::M);
+
         w::field_label(ui, "Redukcja szumów");
         ui.horizontal(|ui| {
             if w::chip(ui, "Włączona", p.noise_suppression).clicked() {
@@ -451,16 +484,120 @@ impl App {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
         ui.add_space(sp::XS);
-        let hint = match (&voice, p.sensitivity) {
-            (None, _) => "Dołącz do kanału głosowego, aby zobaczyć poziom mikrofonu.",
-            (Some(_), None) => "Próg dopasowuje się do szumu tła.",
-            (Some(_), Some(_)) => "Mówisz, gdy poziom przekracza próg na suwaku.",
+        let hint = match (&voice, p.mode, p.sensitivity) {
+            (None, ..) => "Dołącz do kanału głosowego, aby zobaczyć poziom mikrofonu.",
+            (Some(_), Mode::PushToTalk, _) => "Próg decyduje tylko o wskaźniku mówienia; nadajesz, gdy trzymasz klawisz.",
+            (Some(_), Mode::Voice, None) => "Próg dopasowuje się do szumu tła.",
+            (Some(_), Mode::Voice, Some(_)) => "Mówisz, gdy poziom przekracza próg na suwaku.",
         };
         ui.label(w::text(hint, ty::SMALL, c::TEXT_MUTED));
         if p != before {
             self.node.set_voice_prefs(p);
             p.save();
         }
+    }
+
+    /// Push-to-talk: key capture, release delay, key sound and (macOS) the
+    /// Input Monitoring permission.
+    fn ptt_ui(&mut self, ui: &mut Ui, p: &mut crate::voice::Prefs) {
+        self.ptt_field_shown = true;
+        let capturing = self.ptt.capturing();
+        w::field_label(ui, "Klawisz");
+        ui.horizontal(|ui| {
+            let avail = ui.available_width() - 108.0;
+            let (shown, color) = match (capturing, p.ptt_key) {
+                (true, _) => ("Naciśnij klawisz…".to_string(), c::TEXT_MUTED),
+                (false, Some(k)) => (k.name(), c::TEXT),
+                (false, None) => ("Nie ustawiono".to_string(), c::TEXT_MUTED),
+            };
+            w::input_frame(capturing).show(ui, |ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(avail - 26.0, 18.0), egui::Sense::hover());
+                w::paint_text_clipped(ui, rect.left_center(), &shown, f(ty::BODY), color, rect.width());
+            });
+            let (label, kind) = if capturing { ("Anuluj", Kind::Ghost) } else { ("Zmień", Kind::Secondary) };
+            if Button::new(label, kind).width(100.0).show(ui).clicked() {
+                if capturing {
+                    self.ptt.cancel_capture();
+                } else {
+                    self.ptt.start_capture();
+                }
+            }
+        });
+        if capturing {
+            ui.label(w::text(
+                "Naciśnij klawisz albo środkowy lub boczny przycisk myszy. Esc anuluje.",
+                ty::SMALL,
+                c::TEXT_MUTED,
+            ));
+        } else if p.ptt_key.is_none() {
+            ui.label(w::text("Ustaw klawisz, inaczej mikrofon nie będzie nadawał.", ty::SMALL, c::WARNING));
+        } else if cfg!(windows) {
+            ui.add(
+                egui::Label::new(w::text(
+                    "Działa także w tle. Gra uruchomiona jako administrator nie przekaże klawisza, \
+                     jeśli BibiCord nie ma takich samych uprawnień.",
+                    ty::SMALL,
+                    c::TEXT_MUTED,
+                ))
+                .wrap(),
+            );
+        }
+
+        if !crate::ptt::has_permission() {
+            ui.add_space(sp::S);
+            egui::Frame::new()
+                .fill(theme::alpha(c::WARNING, 0.10))
+                .stroke(Stroke::new(1.0, theme::alpha(c::WARNING, 0.35)))
+                .corner_radius(r::CONTROL)
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.label(w::icon(ic::WARNING_CIRCLE, 16.0, c::WARNING));
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::Label::new(w::text(
+                                    "BibiCord potrzebuje zgody „Monitorowanie wprowadzania”, żeby widzieć \
+                                     klawisz, gdy pracujesz w innej aplikacji. Otwórz Ustawienia systemowe → \
+                                     Prywatność i ochrona → Monitorowanie wprowadzania, włącz BibiCord \
+                                     i uruchom aplikację ponownie.",
+                                    ty::SMALL,
+                                    c::TEXT_SECONDARY,
+                                ))
+                                .wrap(),
+                            );
+                            ui.add_space(sp::XS);
+                            let open = Button::new("Otwórz Ustawienia systemowe", Kind::Secondary)
+                                .icon(ic::ARROW_SQUARE_OUT)
+                                .height(32.0)
+                                .show(ui);
+                            if open.clicked() {
+                                crate::ptt::open_permission_settings();
+                            }
+                        });
+                    });
+                });
+        }
+
+        ui.add_space(sp::M);
+        w::field_label_value(ui, "Opóźnienie zwolnienia", &format!("{} ms", p.ptt_release_ms));
+        ui.spacing_mut().slider_width = ui.available_width();
+        ui.add(
+            egui::Slider::new(&mut p.ptt_release_ms, 0..=crate::voice::PTT_RELEASE_MAX)
+                .step_by(20.0)
+                .show_value(false),
+        );
+        ui.label(w::text("Mikrofon nadaje jeszcze chwilę po puszczeniu klawisza.", ty::SMALL, c::TEXT_MUTED));
+
+        ui.add_space(sp::M);
+        w::field_label(ui, "Dźwięk klawisza");
+        ui.horizontal(|ui| {
+            if w::chip(ui, "Włączony", p.ptt_sounds).clicked() {
+                p.ptt_sounds = true;
+            }
+            if w::chip(ui, "Wyłączony", !p.ptt_sounds).clicked() {
+                p.ptt_sounds = false;
+            }
+        });
     }
 
     /// Sound cues: on/off, volume and a preview.
