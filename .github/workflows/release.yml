@@ -1,7 +1,8 @@
 name: build
 
-# Every push to main: tests + both installers as workflow artifacts.
-# Tag v*: a GitHub Release with fixed asset names, so
+# Push to main and PRs: tests only (main also refreshes the Rust cache).
+# Manual run (workflow_dispatch): tests + both installers as workflow artifacts.
+# Tag v*: tests + installers + a GitHub Release with fixed asset names, so
 #   https://github.com/Minfdev/bibicord/releases/latest/download/BibiCord-Setup.exe
 #   https://github.com/Minfdev/bibicord/releases/latest/download/BibiCord.dmg
 # always point at the newest version (the in-app updater uses the same files).
@@ -17,10 +18,16 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Installers only for releases and manual runs; jobs repeat the expression
+  # in their `if` because `env` is not available there.
+  INSTALLERS: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+
 jobs:
   # FFmpeg for Windows, cross-compiled from source (scripts/build-ffmpeg.sh).
   # Cached until packaging/ffmpeg.env or the build script changes.
   ffmpeg-windows:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -44,32 +51,44 @@ jobs:
 
   windows:
     needs: ffmpeg-windows
+    # Runs also when ffmpeg-windows is skipped (no installers).
+    if: ${{ !cancelled() && needs.ffmpeg-windows.result != 'failure' }}
     runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Release + the installer's --target: dependencies compile once and the
+      # installer build below only rebuilds bibicord.
+      - run: cargo test --release --target $TARGET
+        shell: bash
       - uses: taiki-e/install-action@v2
+        if: env.INSTALLERS == 'true'
         with:
           tool: cargo-about
       - uses: actions/download-artifact@v5
+        if: env.INSTALLERS == 'true'
         with:
           name: ffmpeg-windows
           path: target/pkg/ffmpeg/windows
       - name: Check FFmpeg
+        if: env.INSTALLERS == 'true'
         shell: bash
         run: scripts/check-ffmpeg.sh target/pkg/ffmpeg/windows/ffmpeg.exe
       - name: Installer
+        if: env.INSTALLERS == 'true'
         shell: bash
-        env:
-          TARGET: x86_64-pc-windows-msvc
         run: |
           export PATH="/c/Program Files (x86)/NSIS:$PATH"
           command -v makensis || choco install nsis -y --no-progress
           scripts/build-windows-installer.sh target/pkg/ffmpeg/windows/ffmpeg.exe
           cp dist/BibiCord-Setup-*.exe dist/BibiCord-Setup.exe
       - uses: actions/upload-artifact@v5
+        if: env.INSTALLERS == 'true'
         with:
           name: BibiCord-windows
           path: dist/BibiCord-Setup.exe
@@ -81,28 +100,37 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Release: dependencies compile once, shared with the installer build.
+      - run: cargo test --release
       - uses: taiki-e/install-action@v2
+        if: env.INSTALLERS == 'true'
         with:
           tool: cargo-about
       - uses: actions/cache@v4
+        if: env.INSTALLERS == 'true'
         id: ffmpeg-cache
         with:
           path: target/pkg/ffmpeg/macos
           key: ffmpeg-macos-${{ hashFiles('packaging/ffmpeg.env', 'scripts/build-ffmpeg.sh') }}
       - name: Build FFmpeg
-        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        if: env.INSTALLERS == 'true' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
           command -v pkg-config || brew install pkgconf
           scripts/build-ffmpeg.sh macos
       - name: Check FFmpeg
+        if: env.INSTALLERS == 'true'
         run: scripts/check-ffmpeg.sh target/pkg/ffmpeg/macos/ffmpeg
       - uses: astral-sh/setup-uv@v6
+        if: env.INSTALLERS == 'true'
       - name: Installer
+        if: env.INSTALLERS == 'true'
         run: |
           scripts/build-macos-dmg.sh target/pkg/ffmpeg/macos/ffmpeg
           cp dist/BibiCord-*.dmg dist/BibiCord.dmg
       - uses: actions/upload-artifact@v5
+        if: env.INSTALLERS == 'true'
         with:
           name: BibiCord-macos
           path: dist/BibiCord.dmg
