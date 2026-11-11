@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
-const START_CODE: [u8; 4] = [0, 0, 0, 1];
+pub(super) const START_CODE: [u8; 4] = [0, 0, 0, 1];
 const MAX_GOP_CACHE: usize = 48 << 20;
 /// Chunks of encoder output buffered per viewer before it is considered
 /// too slow (one chunk is roughly one frame).
@@ -79,6 +79,19 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;
         inner.viewers.clear();
+    }
+
+    /// A new encoder took over (the old one died): its bitstream starts from
+    /// scratch with fresh parameter sets and a keyframe. Viewers stay
+    /// subscribed and simply continue with the new bitstream.
+    pub fn restart(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let codec = inner.scanner.codec;
+        inner.scanner = Scanner::new(codec);
+        inner.params.clear();
+        inner.gop.clear();
+        inner.gop_bytes = 0;
+        inner.gop_valid = false;
     }
 
     /// Feeds a chunk of encoder output (any size, any alignment).
@@ -170,7 +183,7 @@ fn send_synced(viewers: &mut Vec<Viewer>, data: &Bytes) {
 
 /// Incremental Annex B scanner that finds keyframe boundaries and captures
 /// parameter sets, without ever holding data back.
-struct Scanner {
+pub(super) struct Scanner {
     codec: Codec,
     zeros: u32,
     after_start_code: bool,
@@ -180,15 +193,15 @@ struct Scanner {
 }
 
 #[derive(Default)]
-struct ScanOut {
+pub(super) struct ScanOut {
     /// Offset of the header byte of the first keyframe NAL in the chunk.
-    cut: Option<usize>,
+    pub cut: Option<usize>,
     /// Completed parameter set NALs (type, NAL with 4 byte start code).
-    params: Vec<(u8, Vec<u8>)>,
+    pub params: Vec<(u8, Vec<u8>)>,
 }
 
 impl Scanner {
-    fn new(codec: Codec) -> Self {
+    pub(super) fn new(codec: Codec) -> Self {
         Scanner {
             codec,
             zeros: 0,
@@ -199,7 +212,7 @@ impl Scanner {
         }
     }
 
-    fn scan(&mut self, data: &[u8]) -> ScanOut {
+    pub(super) fn scan(&mut self, data: &[u8]) -> ScanOut {
         let mut out = ScanOut::default();
         for (i, &b) in data.iter().enumerate() {
             if self.after_start_code {
@@ -314,5 +327,44 @@ mod tests {
         hub.push(Bytes::from(nal(0x41, 20)));
         let next = rx.recv().await.unwrap();
         assert_eq!(&next[..5], &[0, 0, 0, 1, 0x41]);
+    }
+
+    #[tokio::test]
+    async fn viewers_continue_after_restart() {
+        let hub = Hub::new(Codec::H264);
+        let mut old = Vec::new();
+        old.extend(nal(0x67, 10));
+        old.extend(nal(0x68, 4));
+        old.extend(nal(0x65, 100));
+        old.extend(nal(0x41, 50));
+        hub.push(Bytes::from(old));
+        let mut rx = hub.subscribe();
+        rx.recv().await.unwrap();
+
+        // The encoder died mid-frame; a new one starts its own bitstream.
+        hub.push(Bytes::from(vec![0, 0, 0, 1, 0x41, 0xAB]));
+        rx.recv().await.unwrap();
+        hub.restart();
+        let mut late = hub.subscribe();
+        assert!(late.try_recv().is_err(), "old keyframe must not be replayed");
+
+        let mut new = Vec::new();
+        new.extend(nal(0x67, 12)); // different SPS (e.g. new resolution)
+        new.extend(nal(0x68, 4));
+        new.extend(nal(0x65, 80));
+        hub.push(Bytes::from(new.clone()));
+        let mut got = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            got.extend_from_slice(&b);
+        }
+        assert_eq!(got, new, "a synced viewer gets the new stream untouched");
+
+        // A viewer that joined during the gap starts at the new keyframe
+        // with the new parameter sets only.
+        let mut first = Vec::new();
+        while let Ok(b) = late.try_recv() {
+            first.extend_from_slice(&b);
+        }
+        assert_eq!(first, new);
     }
 }

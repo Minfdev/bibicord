@@ -796,7 +796,7 @@ impl Node {
         let task = self.0.rt.spawn(async move {
             let res: Result<()> = async {
                 let mut rx = source.await?;
-                let dec = video::decode::Decoder::start(codec, slot2, move || events.repaint())?;
+                let mut dec = video::decode::Decoder::start(codec, slot2, move || events.repaint())?;
                 while let Some(chunk) = rx.recv().await {
                     dec.feed(chunk).await?;
                 }
@@ -831,7 +831,7 @@ impl Node {
                 let (mut send, mut recv) = conn.open_bi().await?;
                 send.write_all(&[TAG_WATCH]).await?;
                 let events = n.0.events.clone();
-                let dec = video::decode::Decoder::start(codec, n.0.frames.clone(), move || {
+                let mut dec = video::decode::Decoder::start(codec, n.0.frames.clone(), move || {
                     events.repaint()
                 })?;
                 while let Some(chunk) = recv.read_chunk(1 << 20).await? {
@@ -1230,5 +1230,73 @@ mod tests {
         a.leave();
         b.leave();
     }
-}
 
+    /// Real screen capture that survives losing it: while it runs, switch a
+    /// game to fullscreen, Alt+Tab, change the display resolution or open UAC.
+    /// The stream must not end and frames must keep coming.
+    /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg BIBICORD_TEST_SECS=60 \
+    ///   cargo test e2e_screen_capture_loss -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_screen_capture_loss() {
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+        unsafe {
+            std::env::set_var("BIBICORD_FAKE_AUDIO", "1");
+        }
+        tokio::task::spawn_blocking(|| crate::ffmpeg::ensure(|_| {})).await.unwrap().unwrap();
+        let secs = std::env::var("BIBICORD_TEST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+            unreachable!()
+        };
+        b.join(&t, "Bob".into()).unwrap();
+        wait_for(&brx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+        a.start_stream(video::encode::Settings { fps: 30, bitrate_kbps: 8_000, ..Default::default() });
+        let Event::MyStream(Some(info)) =
+            wait_for(&arx, 60, |e| matches!(e, Event::MyStream(_) | Event::Error(_))).await
+        else {
+            panic!("stream failed to start")
+        };
+        println!("streaming: {info:?}");
+        let Event::PeerStream { id, .. } =
+            wait_for(&brx, 10, |e| matches!(e, Event::PeerStream { info: Some(_), .. })).await
+        else {
+            unreachable!()
+        };
+        b.watch(id);
+
+        println!(">>> {secs} s: go fullscreen / change resolution now");
+        let slot = b.frames();
+        let start = Instant::now();
+        let mut size = None;
+        let mut last_frame = Instant::now();
+        let mut longest_gap = Duration::ZERO;
+        let mut count = slot.count();
+        while start.elapsed() < Duration::from_secs(secs) {
+            while let Ok(e) = arx.try_recv() {
+                assert!(!matches!(e, Event::Error(_) | Event::MyStream(None)), "stream ended: {e:?}");
+            }
+            if let Some(f) = slot.take() {
+                if size != Some((f.width, f.height)) {
+                    println!("{:>5.1} s: {}x{}", start.elapsed().as_secs_f32(), f.width, f.height);
+                    size = Some((f.width, f.height));
+                }
+            }
+            if slot.count() != count {
+                count = slot.count();
+                longest_gap = longest_gap.max(last_frame.elapsed());
+                last_frame = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        println!("{count} frames, longest gap {longest_gap:?}");
+        assert!(last_frame.elapsed() < Duration::from_secs(2), "no frames at the end");
+        assert!(b.watching().is_some());
+        a.stop_stream();
+        a.leave();
+        b.leave();
+    }
+}
