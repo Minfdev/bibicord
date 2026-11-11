@@ -118,9 +118,11 @@ Oba skrypty wymagają `cargo-about` (`cargo install cargo-about --locked
 --features cli`): generuje licencje bibliotek do folderu `licenses`
 w instalatorze (`scripts/licenses.sh`).
 
-Workflow `.github/workflows/release.yml` buduje oba instalatory przy każdym
-pushu; tag `v*` publikuje je jako release na GitHubie (`BibiCord-Setup.exe`,
-`BibiCord.dmg`, `SHA256SUMS.txt`, `ffmpeg-source.tar`).
+Workflow `.github/workflows/release.yml` przy pushu na `main` i w PR-ach
+uruchamia tylko testy. Oba instalatory buduje dla tagu `v*`, który publikuje je
+jako release na GitHubie (`BibiCord-Setup.exe`, `BibiCord.dmg`,
+`SHA256SUMS.txt`, `ffmpeg-source.tar`), oraz przy ręcznym uruchomieniu
+(Actions → build → Run workflow), wtedy jako artefakty workflow.
 
 ### Wydanie nowej wersji
 
