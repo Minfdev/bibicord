@@ -394,6 +394,11 @@ impl Voice {
         self.shared.muted.store(m, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub fn is_muted(&self) -> bool {
+        self.shared.muted.load(Ordering::Relaxed)
+    }
+
     pub fn set_deafened(&self, d: bool) {
         self.shared.deafened.store(d, Ordering::Relaxed);
     }
@@ -541,8 +546,9 @@ pub fn list_devices() -> (Vec<DeviceInfo>, Vec<DeviceInfo>) {
     (ins, outs)
 }
 
+/// Unit tests never touch real devices (and don't need the env var).
 fn fake_audio() -> bool {
-    std::env::var_os("BIBICORD_FAKE_AUDIO").is_some()
+    cfg!(test) || std::env::var_os("BIBICORD_FAKE_AUDIO").is_some()
 }
 
 /// Encoder side: takes mono samples at `in_rate`, sends Opus packets.
