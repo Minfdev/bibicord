@@ -14,10 +14,11 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// What gets captured.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +96,9 @@ pub fn displays() -> Vec<String> {
 }
 
 /// Starts capturing and encoding. `on_exit` is called if the encoder dies
-/// on its own (not when the broadcast is dropped).
+/// on its own (not when the broadcast is dropped). When FFmpeg's own screen
+/// capture is lost (Windows: a game going fullscreen, UAC, a resolution
+/// change) the encoder is started again into the same [`Hub`] instead.
 pub fn start(s: &Settings, on_exit: impl FnOnce(String) + Send + 'static) -> Result<Broadcast> {
     let (encoder, mut cmd_args, input) = if test_source() {
         let enc = pick_encoder(s.codec, |enc| {
@@ -119,17 +122,8 @@ pub fn start(s: &Settings, on_exit: impl FnOnce(String) + Send + 'static) -> Res
     );
 
     tracing::info!("encoder: ffmpeg {}", cmd_args.join(" "));
-    let mut cmd = ffmpeg::command()?;
-    cmd.args(["-loglevel", "error"]).args(&cmd_args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.stdin(if matches!(input, Input::Pipe { .. }) {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    let mut child = cmd.spawn().context("nie można uruchomić FFmpeg")?;
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let pipe = matches!(input, Input::Pipe { .. });
+    let (mut child, stdout, log) = spawn_encoder(&cmd_args, pipe)?;
     let stdin = child.stdin.take();
 
     let (width, height) = match &input {
@@ -145,43 +139,68 @@ pub fn start(s: &Settings, on_exit: impl FnOnce(String) + Send + 'static) -> Res
     };
     let hub = Arc::new(Hub::new(s.codec));
     let stopped = Arc::new(AtomicBool::new(false));
+    let child = Arc::new(Mutex::new(child));
 
-    let log = Arc::new(Mutex::new(VecDeque::<String>::new()));
     {
-        let log = log.clone();
+        let (hub, stopped, child) = (hub.clone(), stopped.clone(), child.clone());
+        // Natively captured frames (macOS) can't be fed into a new FFmpeg.
+        let restartable = !pipe;
         std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                tracing::warn!("ffmpeg enc: {line}");
-                let mut l = log.lock().unwrap();
-                l.push_back(line);
-                if l.len() > 8 {
-                    l.pop_front();
-                }
-            }
-        });
-    }
-    {
-        let hub = hub.clone();
-        let stopped = stopped.clone();
-        std::thread::spawn(move || {
-            let mut out = stdout;
+            let (mut stdout, mut log) = (stdout, log);
+            let mut started = Instant::now();
+            let mut recovery = Recovery::default();
             let mut buf = vec![0u8; 1 << 20];
             loop {
-                match out.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => hub.push(Bytes::copy_from_slice(&buf[..n])),
+                loop {
+                    match stdout.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => hub.push(Bytes::copy_from_slice(&buf[..n])),
+                    }
+                }
+                let tail = log.join().unwrap_or_default();
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let retry = if restartable {
+                    recovery.next(&tail, started.elapsed(), Instant::now())
+                } else {
+                    None
+                };
+                let Some(delay) = retry else {
+                    hub.close();
+                    on_exit(match (tail.is_empty(), recovery.active()) {
+                        (true, _) => "enkoder zakończył pracę".into(),
+                        (false, false) => tail,
+                        (false, true) => format!("nie udało się wznowić przechwytywania ekranu: {tail}"),
+                    });
+                    return;
+                };
+                tracing::warn!("capture lost, restarting the encoder in {delay:?}");
+                std::thread::sleep(delay);
+                // Under the lock: `Broadcast::drop` either sees the new
+                // child and kills it, or we see `stopped` and don't start it.
+                let mut c = child.lock().unwrap();
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Reap the old FFmpeg first: it may still hold the duplication.
+                let _ = c.wait();
+                match spawn_encoder(&cmd_args, false) {
+                    Ok((new, out, l)) => {
+                        *c = new;
+                        (stdout, log) = (out, l);
+                        started = Instant::now();
+                        hub.restart();
+                    }
+                    Err(e) => {
+                        drop(c);
+                        hub.close();
+                        on_exit(format!("{e:#}"));
+                        return;
+                    }
                 }
             }
             hub.close();
-            if !stopped.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(200));
-                let tail = log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n");
-                on_exit(if tail.is_empty() {
-                    "enkoder zakończył pracę".into()
-                } else {
-                    tail
-                });
-            }
         });
     }
 
@@ -189,7 +208,7 @@ pub fn start(s: &Settings, on_exit: impl FnOnce(String) + Send + 'static) -> Res
     let mut b = Broadcast {
         info,
         hub,
-        child: Arc::new(Mutex::new(child)),
+        child,
         stopped: stopped.clone(),
         #[cfg(target_os = "macos")]
         capture: None,
@@ -207,6 +226,86 @@ pub fn start(s: &Settings, on_exit: impl FnOnce(String) + Send + 'static) -> Res
         }
     }
     Ok(b)
+}
+
+/// Starts FFmpeg with `args`; returns it with its stdout and a thread that
+/// collects the last lines of its log (joined after FFmpeg exits).
+fn spawn_encoder(args: &[String], pipe_stdin: bool) -> Result<(Child, ChildStdout, JoinHandle<String>)> {
+    let mut cmd = ffmpeg::command()?;
+    cmd.args(["-loglevel", "error"]).args(args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if pipe_stdin { Stdio::piped() } else { Stdio::null() });
+    let mut child = cmd.spawn().context("nie można uruchomić FFmpeg")?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let log = std::thread::spawn(move || {
+        let mut tail = VecDeque::new();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            tracing::warn!("ffmpeg enc: {line}");
+            tail.push_back(line);
+            if tail.len() > 8 {
+                tail.pop_front();
+            }
+        }
+        Vec::from(tail).join("\n")
+    });
+    Ok((child, stdout, log))
+}
+
+/// FFmpeg's screen capture stopped because the picture of the desktop is no
+/// longer valid: `DXGI_ERROR_ACCESS_LOST` from Desktop Duplication (fullscreen
+/// app, UAC / lock screen, mode change), or ddagrab noticing a new size or
+/// format of the desktop. Windows expects the capture to be set up again.
+fn capture_lost(log: &str) -> bool {
+    log.contains("887a0026") || log.contains("Output parameters changed")
+}
+
+/// How long capture may stay down before the stream ends.
+const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
+/// An encoder that ran this long had working capture: a later loss starts
+/// a new recovery window.
+const HEALTHY_RUN: Duration = Duration::from_secs(5);
+
+/// Decides whether to start the encoder again after it exited.
+#[derive(Default)]
+struct Recovery {
+    /// When capture was lost, while recovering.
+    since: Option<Instant>,
+    attempts: u32,
+}
+
+impl Recovery {
+    /// `log`: the end of the dead encoder's log, `ran`: how long it ran.
+    /// Returns the delay before the next start, or `None` to give up.
+    fn next(&mut self, log: &str, ran: Duration, now: Instant) -> Option<Duration> {
+        if ran >= HEALTHY_RUN {
+            self.since = None;
+        }
+        let since = match self.since {
+            // While recovering anything may fail (e.g. "access denied"
+            // while UAC is shown): keep trying until the window is over.
+            Some(t) => t,
+            None if capture_lost(log) => {
+                self.attempts = 0;
+                *self.since.insert(now)
+            }
+            None => return None,
+        };
+        if now.duration_since(since) > RECOVERY_WINDOW {
+            return None;
+        }
+        self.attempts += 1;
+        Some(Duration::from_millis(match self.attempts {
+            1 => 100,
+            2 => 250,
+            3 => 500,
+            _ => 1000,
+        }))
+    }
+
+    fn active(&self) -> bool {
+        self.since.is_some()
+    }
 }
 
 #[allow(dead_code)]
@@ -642,6 +741,42 @@ dummy: Immediate exit requested"#;
         assert_eq!(super::parse_cameras(mac), ["FaceTime HD Camera"]);
     }
 
+    #[test]
+    fn restarts_only_after_capture_loss() {
+        use super::{HEALTHY_RUN, RECOVERY_WINDOW, Recovery};
+        use std::time::{Duration, Instant};
+        let lost = "[Parsed_ddagrab_0 @ 1] AcquireNextFrame failed: 887a0026\n\
+                    [in#0/lavfi @ 2] Error during demuxing: Generic error in an external library";
+        let t0 = Instant::now();
+        let long = HEALTHY_RUN * 10;
+
+        // Other errors end the stream.
+        assert_eq!(Recovery::default().next("Error while opening encoder", long, t0), None);
+
+        // Capture lost: retried, also when the next tries fail differently
+        // (UAC still shown), until the window is over.
+        let mut r = Recovery::default();
+        assert_eq!(r.next(lost, long, t0), Some(Duration::from_millis(100)));
+        let denied = "Desktop duplication access denied";
+        assert_eq!(r.next(denied, Duration::ZERO, t0 + Duration::from_secs(1)), Some(Duration::from_millis(250)));
+        assert!(r.next(denied, Duration::ZERO, t0 + RECOVERY_WINDOW).is_some());
+        assert_eq!(r.next(lost, Duration::ZERO, t0 + RECOVERY_WINDOW + Duration::from_secs(1)), None);
+        assert!(r.active());
+
+        // Capture that came back and ran for a while starts a new window.
+        let mut r = Recovery::default();
+        let mut t = t0;
+        for _ in 0..20 {
+            assert!(r.next(lost, long, t).is_some());
+            t += Duration::from_secs(60);
+        }
+        // Back for a while, then a failure that isn't a capture loss.
+        assert_eq!(r.next("Error while opening encoder", long, t), None);
+        assert!(!r.active());
+
+        // ddagrab noticing a new desktop size or format.
+        assert!(Recovery::default().next("[Parsed_ddagrab_0 @ 1] Output parameters changed!", long, t0).is_some());
+    }
     /// Real camera -> encoder -> hub. Needs a camera.
     /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg cargo test camera_stream -- --ignored
     #[test]
