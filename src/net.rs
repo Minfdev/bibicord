@@ -103,6 +103,13 @@ struct State {
     cam_views: HashMap<EndpointId, (Arc<FrameSlot>, tokio::task::JoinHandle<()>)>,
     watch: Option<Watch>,
     voice: Option<Arc<Voice>>,
+    /// A voice start is in flight; its result is kept only if `voice_gen`
+    /// is still the value it started with.
+    voice_starting: bool,
+    voice_gen: u64,
+    /// Bumped by `leave()`: streams and cameras started in an earlier room
+    /// are discarded when their encoder comes up.
+    room_gen: u64,
 }
 
 #[derive(Clone)]
@@ -282,6 +289,9 @@ impl Node {
             w.task.abort();
         }
         s.voice = None;
+        s.voice_starting = false;
+        s.voice_gen += 1;
+        s.room_gen += 1;
     }
 
     pub fn send_chat(&self, text: String) {
@@ -618,6 +628,7 @@ impl Node {
     // -------------------------------------------------------------- video
 
     pub fn start_stream(&self, settings: video::encode::Settings) {
+        let room = self.0.state.lock().unwrap().room_gen;
         let n = self.clone();
         self.spawn(async move {
             n.emit(Event::Status("Uruchamianie enkodera…".into()));
@@ -639,7 +650,13 @@ impl Node {
             match res {
                 Ok(Ok(b)) => {
                     let info = b.info.clone();
-                    n.0.state.lock().unwrap().broadcast = Some(b);
+                    {
+                        let mut s = n.0.state.lock().unwrap();
+                        if s.room_gen != room {
+                            return; // left while starting; dropping `b` stops the encoder
+                        }
+                        s.broadcast = Some(b);
+                    }
                     n.broadcast_msg(Msg::Stream(Some(info.clone())));
                     n.emit(Event::MyStream(Some(info)));
                     n.emit(Event::Status(String::new()));
@@ -688,6 +705,7 @@ impl Node {
     /// Turns our camera on. Peers decode it into their voice tiles; we decode
     /// our own hub for the preview.
     pub fn start_camera(&self, name: Option<String>) {
+        let room = self.0.state.lock().unwrap().room_gen;
         let n = self.clone();
         self.spawn(async move {
             let n2 = n.clone();
@@ -708,7 +726,7 @@ impl Node {
                     let (info, hub) = (b.info.clone(), b.hub.clone());
                     {
                         let mut s = n.0.state.lock().unwrap();
-                        if !s.in_room || s.voice.is_none() {
+                        if s.room_gen != room || !s.in_room || s.voice.is_none() {
                             return n.emit(Event::MyCamera(false)); // left while starting
                         }
                         s.camera = Some(b);
@@ -869,23 +887,40 @@ impl Node {
     }
 
     pub fn join_voice(&self) {
-        if self.voice().is_some() {
-            return;
+        let mut s = self.0.state.lock().unwrap();
+        if s.voice.is_none() && !s.voice_starting {
+            self.start_voice(&mut s);
         }
+    }
+
+    /// Starts voice; supersedes any start already in flight.
+    fn start_voice(&self, s: &mut State) {
+        s.voice_starting = true;
+        s.voice_gen += 1;
+        let (id, devices, deafened, prefs) = (s.voice_gen, s.devices.clone(), s.mute.deafened, s.voice_prefs);
         let n = self.clone();
         self.spawn(async move {
             let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
-            let (devices, mute, prefs) = {
-                let s = n.0.state.lock().unwrap();
-                (s.devices.clone(), s.mute, s.voice_prefs)
+            // Start muted: `set_mute` can't reach a Voice that isn't stored
+            // yet, and frames queued in `tx` meanwhile would go out later.
+            // The real setting is applied below, under the same lock.
+            let res = tokio::task::spawn_blocking(move || Voice::start(tx, devices, true, deafened, prefs)).await;
+            let res = {
+                let mut s = n.0.state.lock().unwrap();
+                if s.voice_gen != id {
+                    return; // cancelled or superseded; dropping the Voice stops it
+                }
+                s.voice_starting = false;
+                res.map(|r| {
+                    r.map(|v| {
+                        v.set_muted(s.mute.muted || s.mute.deafened);
+                        v.set_deafened(s.mute.deafened);
+                        s.voice = Some(Arc::new(v));
+                    })
+                })
             };
-            match tokio::task::spawn_blocking(move || {
-                Voice::start(tx, devices, mute.muted || mute.deafened, mute.deafened, prefs)
-            })
-            .await
-            {
-                Ok(Ok(v)) => {
-                    n.0.state.lock().unwrap().voice = Some(Arc::new(v));
+            match res {
+                Ok(Ok(())) => {
                     n.broadcast_msg(Msg::Voice(true));
                     n.emit(Event::MyVoice(true));
                     let n2 = n.clone();
@@ -927,17 +962,14 @@ impl Node {
 
     /// Changes audio devices; reconnects voice if currently connected.
     pub fn set_devices(&self, devices: crate::voice::Devices) {
-        let in_voice = {
-            let mut s = self.0.state.lock().unwrap();
-            if s.devices == devices {
-                return;
-            }
-            s.devices = devices;
-            s.voice.is_some()
-        };
-        if in_voice {
-            self.0.state.lock().unwrap().voice = None;
-            self.join_voice();
+        let mut s = self.0.state.lock().unwrap();
+        if s.devices == devices {
+            return;
+        }
+        s.devices = devices;
+        if s.voice.is_some() || s.voice_starting {
+            s.voice = None;
+            self.start_voice(&mut s);
         }
     }
 
@@ -959,8 +991,14 @@ impl Node {
 
     pub fn leave_voice(&self) {
         self.stop_camera(); // video is part of the call, as on Discord
-        let v = self.0.state.lock().unwrap().voice.take();
-        if v.is_some() {
+        let (v, starting) = {
+            let mut s = self.0.state.lock().unwrap();
+            s.voice_gen += 1;
+            (s.voice.take(), std::mem::take(&mut s.voice_starting))
+        };
+        // Also while (re)starting: after a device change peers still have
+        // us in voice; an extra `Voice(false)` is harmless.
+        if v.is_some() || starting {
             drop(v);
             self.broadcast_msg(Msg::Voice(false));
             self.emit(Event::MyVoice(false));
@@ -1013,6 +1051,111 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(30), "camera frames: {}", cam_count(n, id));
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// `MyVoice` events that arrive within `ms`; long enough for a fake
+    /// voice start to finish.
+    async fn my_voice_events(rx: &std::sync::mpsc::Receiver<Event>, ms: u64) -> Vec<bool> {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        rx.try_iter().filter_map(|e| if let Event::MyVoice(on) = e { Some(on) } else { None }).collect()
+    }
+
+    /// Leaving the room (and entering another) while voice is starting
+    /// discards the start; a later join works normally.
+    #[tokio::test]
+    async fn leave_cancels_voice_start() {
+        let (a, rx) = node();
+        a.create_room("Ala".into(), "A".into());
+        a.join_voice();
+        a.leave();
+        a.create_room("Ala".into(), "B".into());
+        assert_eq!(my_voice_events(&rx, 500).await, [false; 0]);
+        assert!(a.voice().is_none());
+
+        a.join_voice();
+        wait_for(&rx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        assert!(!a.voice().unwrap().is_muted());
+        a.leave();
+    }
+
+    /// Hanging up while voice is starting cancels it and clears the UI flag.
+    #[tokio::test]
+    async fn leave_voice_cancels_voice_start() {
+        let (a, rx) = node();
+        a.create_room("Ala".into(), "A".into());
+        a.join_voice();
+        a.leave_voice();
+        assert_eq!(my_voice_events(&rx, 500).await, [false]);
+        assert!(a.voice().is_none());
+
+        a.join_voice();
+        wait_for(&rx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        assert!(a.voice().is_some());
+        a.leave();
+    }
+
+    /// Muting (or deafening) while voice is starting holds once it runs.
+    #[tokio::test]
+    async fn mute_during_voice_start() {
+        let (a, rx) = node();
+        a.create_room("Ala".into(), "A".into());
+        for mute in [MuteState { muted: true, deafened: false }, MuteState { muted: false, deafened: true }] {
+            a.set_mute(MuteState::default());
+            a.join_voice();
+            tokio::task::yield_now().await; // the start task reaches spawn_blocking
+            a.set_mute(mute);
+            wait_for(&rx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+            assert!(a.voice().unwrap().is_muted(), "{mute:?}");
+            a.leave_voice();
+        }
+        a.leave();
+    }
+
+    /// A second join or a device change during the start leaves one voice;
+    /// a device change in a call reconnects without `MyVoice(false)`.
+    #[tokio::test]
+    async fn voice_start_runs_once() {
+        let (a, rx) = node();
+        a.create_room("Ala".into(), "A".into());
+        a.join_voice();
+        a.join_voice();
+        a.set_devices(crate::voice::Devices { input: Some("mic".into()), output: None });
+        let e = wait_for(&rx, 10, |e| matches!(e, Event::MyVoice(_))).await;
+        assert!(matches!(e, Event::MyVoice(true)), "{e:?}");
+        assert_eq!(my_voice_events(&rx, 500).await, [false; 0]);
+        assert!(a.voice().is_some());
+
+        a.set_devices(crate::voice::Devices::default());
+        let e = wait_for(&rx, 10, |e| matches!(e, Event::MyVoice(_))).await;
+        assert!(matches!(e, Event::MyVoice(true)), "{e:?}");
+        assert_eq!(my_voice_events(&rx, 500).await, [false; 0]);
+        assert!(a.voice().is_some());
+        a.leave();
+    }
+
+    /// Hanging up while voice restarts after a device change tells peers.
+    /// Run with: cargo test e2e_leave_voice_during_device_switch -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_leave_voice_during_device_switch() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+            unreachable!()
+        };
+        b.join(&t, "Bob".into()).unwrap();
+        wait_for(&arx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+        let ida = a.my_id().unwrap();
+        a.join_voice();
+        wait_for(&brx, 30, |e| matches!(e, Event::PeerVoice { id, on: true } if *id == ida)).await;
+
+        a.set_devices(crate::voice::Devices { input: Some("mic".into()), output: None });
+        a.leave_voice();
+        wait_for(&brx, 10, |e| matches!(e, Event::PeerVoice { id, on: false } if *id == ida)).await;
+        assert!(a.voice().is_none());
+        a.leave();
+        b.leave();
     }
 
     /// Camera next to a screen stream: peers (also late joiners) decode it

@@ -456,10 +456,12 @@ impl App {
         self.ticket = None;
         self.room.clear();
         self.my_stream = None;
+        self.stream_starting = false;
         self.camera_on = false;
         self.camera_starting = false;
         self.cam_tex.clear();
         self.my_voice = false;
+        self.voice_starting = false; // `leave()` cancels a start in flight silently
         self.watching = None;
         self.texture = None;
         self.dialog = None;
