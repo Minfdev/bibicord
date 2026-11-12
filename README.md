@@ -141,6 +141,9 @@ Kliknięcie pobiera instalator, sprawdza jego sumę SHA-256 z
 * Windows: `BibiCord-Setup.exe /S /RESTART` – cicha instalacja i restart.
 * macOS: nowa paczka `.app` z DMG zastępuje starą, aplikacja startuje ponownie.
 
+Gdy wydanie nie ma `SHA256SUMS.txt` albo poprawnej sumy instalatora (lub
+suma się nie zgadza), instalacja jest przerywana.
+
 `BIBICORD_NO_UPDATE=1` wyłącza sprawdzanie.
 
 **Brak podpisu wydawcy.** Instalatory nie są podpisane certyfikatem
