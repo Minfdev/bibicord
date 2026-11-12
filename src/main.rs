@@ -6,6 +6,7 @@ mod ffmpeg;
 mod mic;
 mod net;
 mod proto;
+mod ptt;
 mod sounds;
 mod update;
 mod ui;

@@ -72,6 +72,14 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
   wykrywania mowy jest automatyczna albo ustawiana ręcznie jako próg w dBFS
   (z podglądem poziomu). Ustawienia dźwięku są w „Ustawieniach głosu” i na
   stronie profilu, także przed dołączeniem do pokoju.
+- **Naciśnij, aby mówić.** Zamiast aktywacji głosem mikrofon może nadawać tylko
+  wtedy, gdy trzymasz wybrany klawisz albo środkowy lub boczny przycisk myszy,
+  także gdy BibiCord jest w tle (np. w grze). Klawisz działa dalej w innych
+  programach, opóźnienie zwolnienia (domyślnie 200 ms) nie ucina końca słowa,
+  a wyciszenie ma pierwszeństwo. Klawisz jest odczytywany co 10 ms
+  (`GetAsyncKeyState` / `CGEventSourceKeyState`), bez przechwytywania
+  wejścia. Gra uruchomiona jako administrator nie przekaże klawisza do
+  BibiCord bez takich samych uprawnień.
 - **Dźwięki.** Krótkie sygnały przy wejściu i wyjściu z rozmowy (Twoim
   i znajomych), wyciszeniu mikrofonu i słuchawek, starcie i końcu streamu oraz
   nowej wiadomości. Są syntezowane w kodzie (`src/sounds.rs`), nie pochodzą
@@ -152,6 +160,8 @@ Kliknięcie pobiera instalator, sprawdza jego sumę SHA-256 z
 
 Na macOS przy pierwszym streamie trzeba zezwolić na **Nagrywanie ekranu**,
 a przy głosie na **Mikrofon** (Ustawienia systemowe → Prywatność i ochrona).
+Tryb „Naciśnij, aby mówić” potrzebuje zgody **Monitorowanie wprowadzania**
+(tamże); po jej włączeniu uruchom BibiCord ponownie.
 
 ## Testy
 
@@ -178,6 +188,7 @@ Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 | `src/video/hub.rs` | rozsyłanie strumienia do widzów (klatki kluczowe, wolni widzowie) |
 | `src/video/decode.rs` | dekodowanie sprzętowe do RGBA |
 | `src/voice.rs` | mikrofon/głośniki, Opus, bufor jitter, wykrywanie mówienia |
+| `src/ptt.rs` | globalny klawisz „Naciśnij, aby mówić” (Windows, macOS) |
 | `src/sounds.rs` | dźwięki interfejsu (synteza, odtwarzanie, ustawienia) |
 | `src/ui/theme.rs` | tokeny design systemu i instalacja fontów |
 | `src/ui/widgets.rs` | komponenty |
