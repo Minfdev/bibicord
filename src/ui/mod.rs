@@ -686,8 +686,10 @@ impl App {
         }
         if !d.chat_sent && !self.peers.is_empty() {
             d.chat_sent = true;
-            for line in d.chat.drain(..) {
-                self.node.send_chat(line);
+            for line in std::mem::take(&mut d.chat) {
+                if let Err(e) = self.node.send_chat(line) {
+                    self.error = Some((e.to_string(), Instant::now()));
+                }
             }
             for path in std::mem::take(&mut d.files) {
                 self.send_file_path(&path);

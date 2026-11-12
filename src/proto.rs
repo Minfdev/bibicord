@@ -28,6 +28,19 @@ pub const MAX_FILE_NAME: usize = 100;
 // A file message (data, name in UTF-8, postcard overhead) must fit in a frame.
 const _: () = assert!(MAX_FILE_BYTES + 4 * MAX_FILE_NAME + 32 <= MAX_FRAME);
 
+/// Longest chat message, in bytes of UTF-8.
+pub const MAX_CHAT_BYTES: usize = 1_000_000;
+
+// Larger frames are skipped by `read_msg`, so a message would vanish.
+const _: () = assert!(MAX_CHAT_BYTES + 32 <= MAX_FRAME);
+
+/// Cuts `text` to at most `MAX_CHAT_BYTES`, on a character boundary.
+pub fn clamp_chat(text: &mut String) {
+    if text.len() > MAX_CHAT_BYTES {
+        text.truncate(text.floor_char_boundary(MAX_CHAT_BYTES));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Codec {
     H264,
@@ -263,6 +276,34 @@ mod tests {
         assert_eq!(c.chars().count(), MAX_FILE_NAME);
         assert!(c.ends_with("x.gz"));
         assert_eq!(clean_file_name(&"ą".repeat(300)).chars().count(), MAX_FILE_NAME);
+    }
+
+    #[tokio::test]
+    async fn longest_chat_fits_a_frame() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 16);
+        let text = "x".repeat(MAX_CHAT_BYTES);
+        let sent = text.clone();
+        let writer = tokio::spawn(async move { write_msg(&mut a, &Msg::Chat { text: sent }).await.unwrap() });
+        assert!(matches!(read_msg(&mut b).await.unwrap(), Msg::Chat { text: t } if t == text));
+        writer.await.unwrap();
+    }
+
+    #[test]
+    fn chat_is_clamped_on_char_boundary() {
+        let mut s = "x".repeat(MAX_CHAT_BYTES + 10);
+        clamp_chat(&mut s);
+        assert_eq!(s.len(), MAX_CHAT_BYTES);
+        // "ą" is 2 bytes, the emoji 4: with odd padding both straddle the limit.
+        for (pad, ch) in [(1, "ą"), (1, "😀"), (2, "😀"), (3, "😀")] {
+            let mut s = "x".repeat(MAX_CHAT_BYTES - pad) + &ch.repeat(3);
+            clamp_chat(&mut s);
+            assert!(s.len() <= MAX_CHAT_BYTES && s.len() > MAX_CHAT_BYTES - 4, "{pad} {ch}");
+            assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+            assert!(s.starts_with(&"x".repeat(MAX_CHAT_BYTES - pad)));
+        }
+        let mut s = "cześć 😀".to_string();
+        clamp_chat(&mut s);
+        assert_eq!(s, "cześć 😀");
     }
 
     #[tokio::test]

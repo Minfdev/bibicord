@@ -173,18 +173,21 @@ pub fn spawn_install(state: Shared, release: Release, ctx: eframe::egui::Context
 }
 
 fn download(release: &Release, progress: impl Fn(f32)) -> Result<PathBuf> {
-    let dir = crate::ffmpeg::data_dir().join("update");
-    std::fs::create_dir_all(&dir)?;
+    download_to(&crate::ffmpeg::data_dir().join("update"), release, progress)
+}
+
+/// Like `download`, into `dir`. Never installs without a valid checksum,
+/// which is settled before the installer is requested.
+fn download_to(dir: &Path, release: &Release, progress: impl Fn(f32)) -> Result<PathBuf> {
+    let url = release.sums.as_deref().context("brak sum kontrolnych w wydaniu (SHA256SUMS.txt)")?;
+    let text = (|| -> Result<String> {
+        Ok(agent().get(url).call()?.body_mut().with_config().limit(64 << 10).read_to_string()?)
+    })()
+    .context("pobieranie sum kontrolnych")?;
+    let expected = sum_for(&text, ASSET).context("brak sumy kontrolnej instalatora")?;
+
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(ASSET);
-
-    let expected = match &release.sums {
-        Some(url) => {
-            let text = agent().get(url).call()?.body_mut().read_to_string()?;
-            Some(sum_for(&text, ASSET).context("brak sumy kontrolnej instalatora")?)
-        }
-        None => None,
-    };
-
     let mut resp = agent().get(&release.installer).call().context("pobieranie aktualizacji")?;
     let total = resp.body().content_length().unwrap_or(0);
     let mut reader = resp.body_mut().with_config().limit(1 << 30).reader();
@@ -207,11 +210,9 @@ fn download(release: &Release, progress: impl Fn(f32)) -> Result<PathBuf> {
     file.sync_all()?;
     drop(file);
     let got = hex(&hasher.finalize());
-    if let Some(want) = expected {
-        if !got.eq_ignore_ascii_case(&want) {
-            let _ = std::fs::remove_file(&path);
-            bail!("plik aktualizacji jest uszkodzony (zła suma SHA-256)");
-        }
+    if !got.eq_ignore_ascii_case(&expected) {
+        let _ = std::fs::remove_file(&path);
+        bail!("plik aktualizacji jest uszkodzony (zła suma SHA-256)");
     }
     Ok(path)
 }
@@ -226,7 +227,7 @@ fn sum_for(text: &str, name: &str) -> Option<String> {
         let mut it = l.split_whitespace();
         let sum = it.next()?;
         let file = it.next()?.trim_start_matches('*');
-        (file == name && sum.len() == 64).then(|| sum.to_string())
+        (file == name && sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sum.to_string())
     })
 }
 
@@ -311,6 +312,99 @@ mod tests {
         assert_eq!(sum_for(&sums, "BibiCord.dmg"), Some("a".repeat(64)));
         assert_eq!(sum_for(&sums, "BibiCord-Setup.exe"), Some("b".repeat(64)));
         assert_eq!(sum_for(&sums, "x"), None);
+        assert_eq!(sum_for(&("g".repeat(64) + "  BibiCord.dmg"), "BibiCord.dmg"), None);
+    }
+
+    /// Local HTTP server: `/sums` and `/installer` (status, body); counts
+    /// requests per path.
+    fn serve(routes: Vec<(&'static str, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut req = Vec::new();
+                let mut b = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") && conn.read(&mut b).unwrap_or(0) == 1 {
+                    req.push(b[0]);
+                }
+                let req = String::from_utf8_lossy(&req);
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                h.lock().unwrap().push(path.clone());
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, ..)| *p == path)
+                    .map(|(_, s, b)| (*s, b.clone()))
+                    .unwrap_or((404, Vec::new()));
+                let head = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = conn.write_all(head.as_bytes());
+                let _ = conn.write_all(&body);
+            }
+        });
+        (base, hits)
+    }
+
+    fn release(base: &str, sums: bool) -> Release {
+        Release {
+            version: semver::Version::new(9, 9, 9),
+            notes: String::new(),
+            page: String::new(),
+            installer: format!("{base}/installer"),
+            sums: sums.then(|| format!("{base}/sums")),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bibicord-update-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// Without a valid checksum for the installer nothing is downloaded.
+    #[test]
+    fn refuses_install_without_valid_sum() {
+        let body = b"installer".to_vec();
+        let good = hex(&Sha256::digest(&body));
+        let cases: Vec<(&str, bool, Option<String>)> = vec![
+            ("no-sums", false, None),
+            ("no-entry", true, Some(format!("{good}  other.dmg\n"))),
+            ("short", true, Some(format!("{}  {ASSET}\n", &good[1..]))),
+            ("not-hex", true, Some(format!("{}  {ASSET}\n", "z".repeat(64)))),
+            ("sums-404", true, None),
+        ];
+        for (name, has_sums, sums) in cases {
+            let mut routes = vec![("/installer", 200, body.clone())];
+            if let Some(s) = sums {
+                routes.push(("/sums", 200, s.into_bytes()));
+            }
+            let (base, hits) = serve(routes);
+            let dir = temp_dir(name);
+            let res = download_to(&dir, &release(&base, has_sums), |_| {});
+            assert!(res.is_err(), "{name}");
+            assert!(!hits.lock().unwrap().iter().any(|p| p == "/installer"), "{name}: installer requested");
+            assert!(!dir.join(ASSET).exists(), "{name}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn download_checks_sum() {
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
+        let good = hex(&Sha256::digest(&body));
+        for (name, sum, ok) in [("bad", "0".repeat(64), false), ("good", good.clone(), true), ("upper", good.to_uppercase(), true)] {
+            let (base, _) = serve(vec![("/installer", 200, body.clone()), ("/sums", 200, format!("{sum} *{ASSET}\n").into_bytes())]);
+            let dir = temp_dir(name);
+            let res = download_to(&dir, &release(&base, true), |_| {});
+            assert_eq!(res.is_ok(), ok, "{name}: {res:?}");
+            if ok {
+                assert_eq!(std::fs::read(res.unwrap()).unwrap(), body);
+            } else {
+                assert!(!dir.join(ASSET).exists(), "{name}: corrupt file kept");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Talks to the real GitHub API. Run with `cargo test -- --ignored`.
