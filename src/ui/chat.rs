@@ -3,7 +3,7 @@
 use super::theme::{self, W, c, f, r, sp, ty};
 use super::widgets::{self as w, Avatar, Button, IconButton, Kind, ic};
 use super::{App, ChatItem, ChatKind};
-use crate::proto::MAX_FILE_BYTES;
+use crate::proto::{self, MAX_CHAT_BYTES, MAX_FILE_BYTES};
 use eframe::egui::{self, Align2, Key, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 use std::path::Path;
 use std::time::Instant;
@@ -236,6 +236,8 @@ impl App {
                         .desired_width(width - 6.0 - 6.0 - 2.0 * (34.0 + sp::S))
                         .show(ui)
                         .response;
+                    // Pasted text over the limit is cut at the end.
+                    proto::clamp_chat(&mut self.chat_input);
                     send |= resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     let col = if has_text { c::BRAND } else { c::TEXT_MUTED };
                     send |= IconButton::new(ic::PAPER_PLANE_RIGHT, "Wyślij (Enter)")
@@ -245,18 +247,31 @@ impl App {
                         .clicked();
                 });
             });
+        let len = self.chat_input.len();
+        if let Some(count) = chat_counter(len) {
+            let col = if len >= MAX_CHAT_BYTES { c::DANGER } else { c::TEXT_MUTED };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(w::text(count, ty::SMALL, col));
+            });
+        }
         if send {
             let text = self.chat_input.trim().to_string();
-            if !text.is_empty() {
-                self.node.send_chat(text);
+            let res = if text.is_empty() { Ok(()) } else { self.node.send_chat(text) };
+            match res {
+                Ok(()) => self.chat_input.clear(),
+                Err(e) => self.error = Some((e.to_string(), Instant::now())),
             }
-            self.chat_input.clear();
             ui.memory_mut(|m| m.request_focus(id));
         }
         if attach {
             self.pick_files();
         }
     }
+}
+
+/// "987 / 1000 KB" once a message reaches 90% of the limit.
+fn chat_counter(len: usize) -> Option<String> {
+    (len * 10 >= MAX_CHAT_BYTES * 9).then(|| format!("{} / {} KB", len / 1000, MAX_CHAT_BYTES / 1000))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -384,4 +399,18 @@ fn system_line(
         galley,
         c::TEXT,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_from_90_percent() {
+        assert_eq!(chat_counter(0), None);
+        assert_eq!(chat_counter(MAX_CHAT_BYTES * 9 / 10 - 1), None);
+        assert_eq!(chat_counter(MAX_CHAT_BYTES * 9 / 10).as_deref(), Some("900 / 1000 KB"));
+        assert_eq!(chat_counter(987_654).as_deref(), Some("987 / 1000 KB"));
+        assert_eq!(chat_counter(MAX_CHAT_BYTES).as_deref(), Some("1000 / 1000 KB"));
+    }
 }

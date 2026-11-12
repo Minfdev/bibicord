@@ -294,7 +294,11 @@ impl Node {
         s.room_gen += 1;
     }
 
-    pub fn send_chat(&self, text: String) {
+    /// Posts a chat message to everyone in the room; at most `MAX_CHAT_BYTES`.
+    pub fn send_chat(&self, text: String) -> Result<()> {
+        if text.len() > proto::MAX_CHAT_BYTES {
+            bail!("Wiadomość jest za długa (maks. 1 MB)");
+        }
         let s = self.0.state.lock().unwrap();
         for p in s.peers.values() {
             let _ = p.ctrl.send(Msg::Chat { text: text.clone() });
@@ -302,6 +306,7 @@ impl Node {
         let name = s.name.clone();
         drop(s);
         self.emit(Event::Chat { from: None, name, text });
+        Ok(())
     }
 
     /// Posts a file to everyone in the room; at most `MAX_FILE_BYTES`.
@@ -519,6 +524,10 @@ impl Node {
         while let Ok(msg) = proto::read_msg(&mut recv).await {
             match msg {
                 Msg::Chat { text } => {
+                    if text.len() > proto::MAX_CHAT_BYTES {
+                        tracing::warn!("dropping {} B chat message from {remote}", text.len());
+                        continue;
+                    }
                     let name = self.peer_name(&remote);
                     self.emit(Event::Chat { from: Some(remote), name, text });
                 }
@@ -1210,6 +1219,62 @@ mod tests {
         }
     }
 
+    /// Too long a message is refused before anything is sent or echoed;
+    /// one of exactly the limit goes through.
+    #[tokio::test]
+    async fn send_chat_limit() {
+        let (a, rx) = node();
+        a.create_room("Ala".into(), "A".into());
+        assert!(a.send_chat("x".repeat(proto::MAX_CHAT_BYTES + 1)).is_err());
+        a.send_chat("x".repeat(proto::MAX_CHAT_BYTES)).unwrap();
+        let chats: Vec<usize> = rx
+            .try_iter()
+            .filter_map(|e| if let Event::Chat { from: None, text, .. } = e { Some(text.len()) } else { None })
+            .collect();
+        assert_eq!(chats, [proto::MAX_CHAT_BYTES]);
+        a.leave();
+    }
+
+    /// Chat at the length limit over the real network arrives intact; longer
+    /// messages from a peer that skips the check are dropped (whether they
+    /// fit in a frame or not) without losing the connection.
+    /// Run with: cargo test e2e_long_chat -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_long_chat() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+            unreachable!()
+        };
+        b.join(&t, "Bob".into()).unwrap();
+        wait_for(&arx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+        wait_for(&brx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+
+        let long: String = "zażółć 😀 ".repeat(proto::MAX_CHAT_BYTES / 16);
+        let mut long = long + &"x".repeat(proto::MAX_CHAT_BYTES);
+        proto::clamp_chat(&mut long);
+        b.send_chat(long.clone()).unwrap();
+        let Event::Chat { text, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Chat { from: Some(_), .. })).await
+        else {
+            unreachable!()
+        };
+        assert!(text == long, "message changed: {} B", text.len());
+
+        // Over the limit but within a frame: the receiver's check drops it.
+        // Far over: `read_msg` skips the frame.
+        let ctrl = b.0.state.lock().unwrap().peers.get(&a.my_id().unwrap()).unwrap().ctrl.clone();
+        ctrl.send(Msg::Chat { text: "y".repeat(proto::MAX_CHAT_BYTES + 1000) }).unwrap();
+        ctrl.send(Msg::Chat { text: "z".repeat(2 << 20) }).unwrap();
+        b.send_chat("po długiej".into()).unwrap();
+        let e = wait_for(&arx, 20, |e| matches!(e, Event::Chat { from: Some(_), .. } | Event::PeerLeft { .. })).await;
+        assert!(matches!(&e, Event::Chat { text, .. } if text == "po długiej"), "{e:?}");
+        assert!(a.0.state.lock().unwrap().peers.contains_key(&b.my_id().unwrap()));
+        a.leave();
+        b.leave();
+    }
+
     /// Files in chat over the real network: everyone in the room gets the
     /// exact bytes, too large files are refused by the sender and dropped by
     /// the receiver without losing the connection.
@@ -1251,7 +1316,7 @@ mod tests {
         let ctrl = b.0.state.lock().unwrap().peers.get(&a.my_id().unwrap()).unwrap().ctrl.clone();
         ctrl.send(Msg::File { name: "big.bin".into(), data: vec![0; proto::MAX_FILE_BYTES + 1] }).unwrap();
         ctrl.send(Msg::File { name: "huge.bin".into(), data: vec![0; 2 << 20] }).unwrap();
-        b.send_chat("po pliku".into());
+        b.send_chat("po pliku".into()).unwrap();
         let e = wait_for(&arx, 20, |e| matches!(e, Event::File { .. } | Event::Chat { .. } | Event::PeerLeft { .. })).await;
         assert!(matches!(&e, Event::Chat { text, .. } if text == "po pliku"), "{e:?}");
         assert!(a.0.state.lock().unwrap().peers.contains_key(&b.my_id().unwrap()));
@@ -1292,13 +1357,13 @@ mod tests {
         wait_for(&brx, 30, |e| matches!(e, Event::PeerJoined { name, .. } if name == "Cyryl")).await;
         c.leave();
 
-        b.send_chat("cześć".into());
+        b.send_chat("cześć".into()).unwrap();
         wait_for(&arx, 10, |e| matches!(e, Event::Chat { text, from: Some(_), .. } if text == "cześć")).await;
 
         // Profile change reaches the others and is used for later chat.
         b.set_profile("Bobek".into(), Some(pic.clone()));
         wait_for(&arx, 10, |e| matches!(e, Event::PeerProfile { name, avatar: Some(_), .. } if name == "Bobek")).await;
-        b.send_chat("już Bobek".into());
+        b.send_chat("już Bobek".into()).unwrap();
         wait_for(&arx, 10, |e| matches!(e, Event::Chat { name, .. } if name == "Bobek")).await;
 
         // Voice both ways; it keeps running while the stream below is watched.
