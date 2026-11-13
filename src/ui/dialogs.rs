@@ -506,12 +506,12 @@ impl App {
 
     fn invite_ui(&mut self, ui: &mut Ui) {
         let title = format!("Zaproś do: {}", self.room);
-        if header(ui, &title, "Wyślij kod znajomemu. Połączenie jest bezpośrednie, bez serwera.") {
+        if header(ui, &title, "Wyślij link znajomemu. Połączenie jest bezpośrednie, bez serwera.") {
             self.dialog = None;
         }
         let ctx = ui.ctx().clone();
         body(ui, |ui| {
-            w::field_label(ui, "Kod zaproszenia");
+            w::field_label(ui, "Link zaproszenia");
             let copied = self.was_copied(&ctx, "code");
             egui::Frame::new()
                 .fill(c::BG_BASE)
@@ -522,8 +522,9 @@ impl App {
                         let avail = ui.available_width() - 104.0;
                         let shown = self.ticket.as_deref().unwrap_or("Generowanie…");
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, 38.0), egui::Sense::hover());
+                        // The link is longer than the field: shown cut, copied whole.
                         let font = if self.ticket.is_some() {
-                            egui::FontId::monospace(20.0)
+                            egui::FontId::monospace(13.0)
                         } else {
                             theme::font(14.0, W::Regular)
                         };
@@ -541,11 +542,25 @@ impl App {
                         }
                     });
                 });
+            ui.add_space(sp::XS);
+            ui.horizontal(|ui| {
+                if let (Some(_), Some(exp)) = (&self.ticket, self.ticket_expires) {
+                    ui.label(w::text(format!("Ważny do {}", exp.format("%d.%m, %H:%M")), ty::SMALL, c::TEXT_MUTED));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let b = Button::new("Nowy link", Kind::Ghost).icon(ic::ARROW_CLOCKWISE).enabled(self.ticket.is_some()).show(ui);
+                    if b.on_hover_text("Poprzedni link przestanie działać").clicked() {
+                        self.ticket = None;
+                        self.ticket_expires = None;
+                        self.node.new_invite();
+                    }
+                });
+            });
             ui.add_space(sp::L);
             for (n, step) in [
-                "Skopiuj kod i wyślij go znajomemu.",
-                "Znajomy wpisuje kod na ekranie startowym i klika Dołącz.",
-                "Pokój działa, dopóki ktoś w nim jest.",
+                "Skopiuj link i wyślij go znajomemu.",
+                "Znajomy wkleja link na ekranie startowym i klika Dołącz.",
+                "Link działa 24 godziny albo do Twojego wyjścia z pokoju.",
             ]
             .iter()
             .enumerate()
@@ -568,7 +583,7 @@ impl App {
                 ("Kopiuj z linkiem", Kind::Secondary, ic::LINK)
             };
             let b = Button::new(label, kind).icon(icon).enabled(self.ticket.is_some()).show(ui);
-            if b.on_hover_text("Wiadomość z linkami do instalatorów i kodem pokoju").clicked() {
+            if b.on_hover_text("Wiadomość z linkami do instalatorów i linkiem do pokoju").clicked() {
                 let m = self.share_message();
                 self.copy(&ctx, "invite_msg", m);
             }
@@ -668,7 +683,7 @@ impl App {
                 ("Kopiuj wiadomość", Kind::Primary, ic::CHAT_TEXT)
             };
             let tip = if self.screen == super::Screen::Room && self.ticket.is_some() {
-                "Tekst z linkami do obu instalatorów i kodem tego pokoju"
+                "Tekst z linkami do obu instalatorów i linkiem do tego pokoju"
             } else {
                 "Tekst z linkami do obu instalatorów"
             };

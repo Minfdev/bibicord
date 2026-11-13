@@ -1,13 +1,13 @@
 //! Wire protocol shared by all peers.
 
-use anyhow::{Context, Result, bail};
-use iroh::{EndpointAddr, EndpointId};
+use anyhow::{Result, bail};
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on every incompatible change; mismatched versions get a clear
 /// "update the app" error instead of garbled messages.
-pub const ALPN: &[u8] = b"bibicord/6";
+pub const ALPN: &[u8] = b"bibicord/7";
 
 /// First byte of every bidirectional stream.
 pub const TAG_CONTROL: u8 = 0;
@@ -74,8 +74,24 @@ pub struct StreamInfo {
     pub encoder: String,
 }
 
+/// Proof sent before anything else on a connection (see `proof`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Auth {
+    /// Joining with an invite link: keyed by the link's token.
+    Invite { proof: [u8; 32] },
+    /// Mesh connection inside a room: keyed by the room secret.
+    Member { proof: [u8; 32] },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Msg {
+    /// First message of the caller.
+    Auth(Auth),
+    /// Answer to a bad `Auth`; the connection is closed.
+    Denied,
+    /// Answer to a good `Auth`: the callee's own proof, and the room
+    /// secret for someone joining with an invite.
+    Welcome { proof: [u8; 32], room_secret: Option<[u8; 32]> },
     Hello {
         name: String,
         room: String,
@@ -171,86 +187,164 @@ pub async fn read_msg(r: &mut (impl AsyncRead + Unpin)) -> Result<Msg> {
 
 // ------------------------------------------------------------------ invites
 //
-// An invite is a short code like `K7QX-3MFA-9TZP` (60 random bits, Crockford
-// base32). Each app session picks a code and derives its endpoint key from
-// it, so the code *is* the address: the joiner derives the same public key
-// and finds the endpoint through iroh's address lookup (pkarr / DNS). The
-// derivation is deliberately slow to make guessing codes from a public key
-// impractical.
+// An invite link carries the inviter's endpoint id (the address; iroh finds
+// it through address lookup) and a random token valid for 24 h. The token
+// never travels in the clear: the joiner proves it knows it with `proof`,
+// bound to the TLS session. Members of a room share a random room secret,
+// handed to joiners in `Msg::Welcome`, and prove it the same way.
 
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const CODE_LEN: usize = 12;
-const KDF_ROUNDS: u32 = 200_000;
+pub const INVITE_PREFIX: &str = "bibicord://join/";
+const INVITE_VERSION: u8 = 1;
+const INVITE_LEN: usize = 1 + 32 + 16 + 4;
 
-/// A fresh random invite code (60 bits).
-pub fn new_code() -> String {
-    let rnd = iroh::SecretKey::generate().to_bytes();
-    let mut v = u64::from_le_bytes(rnd[..8].try_into().unwrap()) & ((1 << 60) - 1);
-    let mut code = String::with_capacity(CODE_LEN);
-    for _ in 0..CODE_LEN {
-        code.push(CROCKFORD[(v & 31) as usize] as char);
-        v >>= 5;
+pub const NOT_AN_INVITE: &str = "To nie jest link zaproszenia BibiCord";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InviteLink {
+    pub id: EndpointId,
+    pub token: [u8; 16],
+    /// Unix seconds; only a hint for the joiner (the inviter decides).
+    pub expires: u32,
+}
+
+/// `bibicord://join/<base32>`.
+pub fn format_invite(i: &InviteLink) -> String {
+    let mut b = Vec::with_capacity(INVITE_LEN);
+    b.push(INVITE_VERSION);
+    b.extend_from_slice(i.id.as_bytes());
+    b.extend_from_slice(&i.token);
+    b.extend_from_slice(&i.expires.to_le_bytes());
+    INVITE_PREFIX.to_string() + &data_encoding::BASE32_NOPAD.encode(&b).to_ascii_lowercase()
+}
+
+pub fn parse_invite(input: &str) -> Result<InviteLink> {
+    let s = input.trim();
+    let s = match s.get(..INVITE_PREFIX.len()) {
+        Some(p) if p.eq_ignore_ascii_case(INVITE_PREFIX) => &s[INVITE_PREFIX.len()..],
+        _ => s,
+    };
+    if is_old_code(s) {
+        bail!("To kod ze starszej wersji BibiCord. Poproś o nowy link zaproszenia");
     }
-    code
-}
-
-/// `K7QX3MFA9TZP` -> `K7QX-3MFA-9TZP`.
-pub fn format_code(code: &str) -> String {
-    code.as_bytes()
-        .chunks(4)
-        .map(|c| std::str::from_utf8(c).unwrap())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-/// Normalises user input: case, separators, and look-alike letters.
-pub fn parse_code(input: &str) -> Option<String> {
-    let mut out = String::new();
-    for ch in input.trim().chars() {
-        let c = match ch.to_ascii_uppercase() {
-            '-' | ' ' | '_' | '.' => continue,
-            'O' => '0',
-            'I' | 'L' => '1',
-            'U' => 'V',
-            c if CROCKFORD.contains(&(c as u8)) && c.is_ascii() => c,
-            _ => return None,
-        };
-        out.push(c);
+    let Ok(b) = data_encoding::BASE32_NOPAD.decode(s.to_ascii_uppercase().as_bytes()) else { bail!(NOT_AN_INVITE) };
+    if b.first().is_some_and(|v| *v > INVITE_VERSION) {
+        bail!("Ten link wymaga nowszej wersji BibiCord. Zaktualizuj aplikację");
     }
-    (out.len() == CODE_LEN).then_some(out)
-}
-
-/// Endpoint secret key for an invite code.
-pub fn code_key(code: &str) -> iroh::SecretKey {
-    let mut h = blake3::derive_key("bibicord 2026 invite code v1", code.as_bytes());
-    for _ in 0..KDF_ROUNDS {
-        h = *blake3::hash(&h).as_bytes();
+    if b.len() != INVITE_LEN || b[0] != INVITE_VERSION {
+        bail!(NOT_AN_INVITE);
     }
-    iroh::SecretKey::from_bytes(&h)
+    let Ok(id) = EndpointId::from_bytes(b[1..33].try_into().unwrap()) else { bail!(NOT_AN_INVITE) };
+    Ok(InviteLink {
+        id,
+        token: b[33..49].try_into().unwrap(),
+        expires: u32::from_le_bytes(b[49..53].try_into().unwrap()),
+    })
 }
 
-/// Resolves an invite code to the address of the member who shared it.
-pub fn decode_ticket(ticket: &str) -> Result<EndpointAddr> {
-    let code = parse_code(ticket)
-        .context("to nie jest kod zaproszenia BibiCord (12 znaków, np. K7QX-3MFA-9TZP)")?;
-    Ok(EndpointAddr::from(code_key(&code).public()))
+/// A 12-character invite code of BibiCord up to 0.4 (`K7QX-3MFA-9TZP`).
+fn is_old_code(s: &str) -> bool {
+    const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZOILU";
+    let mut n = 0;
+    for ch in s.chars() {
+        match ch.to_ascii_uppercase() {
+            '-' | ' ' | '_' | '.' => {}
+            c if c.is_ascii() && CROCKFORD.contains(c) => n += 1,
+            _ => return false,
+        }
+    }
+    n == 12
+}
+
+/// 32 random bytes.
+pub fn random32() -> [u8; 32] {
+    iroh::SecretKey::generate().to_bytes()
+}
+
+pub const ROLE_CALLER: u8 = 0;
+pub const ROLE_CALLEE: u8 = 1;
+
+pub fn invite_key(token: &[u8; 16]) -> [u8; 32] {
+    blake3::derive_key("bibicord 2026 invite proof v1", token)
+}
+
+pub fn room_key(secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("bibicord 2026 room proof v1", secret)
+}
+
+/// Proof of knowing `key` on one connection: `exporter` comes from the TLS
+/// session, so a proof can't be replayed elsewhere; the ids and role keep
+/// it from being reflected back.
+pub fn proof(key: &[u8; 32], role: u8, exporter: &[u8; 32], caller: &EndpointId, callee: &EndpointId) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(&[role]);
+    h.update(exporter);
+    h.update(caller.as_bytes());
+    h.update(callee.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Constant-time comparison (`blake3::Hash` compares in constant time).
+pub fn proof_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    blake3::Hash::from_bytes(*a) == blake3::Hash::from_bytes(*b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn link() -> InviteLink {
+        InviteLink { id: iroh::SecretKey::generate().public(), token: [7; 16], expires: 1_900_000_000 }
+    }
+
     #[test]
-    fn codes_roundtrip_and_normalise() {
-        let c = new_code();
-        assert_eq!(c.len(), 12);
-        let shown = format_code(&c);
-        assert_eq!(shown.len(), 14);
-        assert_eq!(parse_code(&shown.to_lowercase()).as_deref(), Some(c.as_str()));
-        assert_eq!(parse_code(" k7qx 3mfa-9tzo ").as_deref(), Some("K7QX3MFA9TZ0"));
-        assert!(parse_code("K7QX-3MFA").is_none());
-        let a = decode_ticket(&shown).unwrap();
-        assert_eq!(a.id, code_key(&c).public());
+    fn invite_links_roundtrip() {
+        let l = link();
+        let s = format_invite(&l);
+        assert!(s.starts_with(INVITE_PREFIX));
+        let data = &s[INVITE_PREFIX.len()..];
+        assert_eq!(data, data.to_lowercase());
+        assert_eq!(data.len(), 85); // 53 bytes, base32 without padding
+        assert_eq!(parse_invite(&s).unwrap(), l);
+        for v in [format!("  {s}\n"), s.to_uppercase(), data.to_string(), format!("\t{}  ", data.to_uppercase())] {
+            assert_eq!(parse_invite(&v).unwrap(), l, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn bad_invite_links() {
+        let err = |s: &str| parse_invite(s).unwrap_err().to_string();
+        let s = format_invite(&link());
+        let enc = |b: &[u8]| data_encoding::BASE32_NOPAD.encode(b).to_lowercase();
+        let mut raw = data_encoding::BASE32_NOPAD.decode(s[INVITE_PREFIX.len()..].to_uppercase().as_bytes()).unwrap();
+        for bad in [&s[..s.len() - 1], &format!("{s}a"), "", "xyz!", "https://example.com/join", &enc(&raw[..52]), &enc(&[raw.clone(), vec![0]].concat())] {
+            assert_eq!(err(bad), NOT_AN_INVITE, "{bad:?}");
+        }
+        raw[0] = 0;
+        assert_eq!(err(&enc(&raw)), NOT_AN_INVITE);
+        raw[0] = 2;
+        assert!(err(&enc(&raw)).contains("nowszej wersji"));
+        raw.truncate(20); // a future format may be shorter
+        assert!(err(&enc(&raw)).contains("nowszej wersji"));
+        for old in ["K7QX-3MFA-9TZP", " k7qx 3mfa 9tzo ", "K7QX3MFA9TZP"] {
+            assert!(err(old).contains("starszej wersji"), "{old:?}");
+        }
+    }
+
+    #[test]
+    fn proofs_depend_on_everything() {
+        let (a, b) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
+        let (k, ex) = (room_key(&[1; 32]), [2; 32]);
+        let p = proof(&k, ROLE_CALLER, &ex, &a, &b);
+        assert!(proof_eq(&p, &proof(&k, ROLE_CALLER, &ex, &a, &b)));
+        for other in [
+            proof(&k, ROLE_CALLEE, &ex, &a, &b),
+            proof(&room_key(&[3; 32]), ROLE_CALLER, &ex, &a, &b),
+            proof(&invite_key(&[1; 16]), ROLE_CALLER, &ex, &a, &b),
+            proof(&k, ROLE_CALLER, &[4; 32], &a, &b),
+            proof(&k, ROLE_CALLER, &ex, &b, &a),
+        ] {
+            assert!(!proof_eq(&p, &other));
+        }
     }
 
     #[test]

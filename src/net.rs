@@ -3,7 +3,7 @@
 //! are only used for the initial rendezvous or when a direct path is
 //! impossible. There is no server of our own.
 
-use crate::proto::{self, ALPN, DGRAM_VOICE, Msg, StreamInfo, TAG_CAMERA, TAG_CONTROL, TAG_WATCH};
+use crate::proto::{self, ALPN, Auth, DGRAM_VOICE, Msg, StreamInfo, TAG_CAMERA, TAG_CONTROL, TAG_WATCH};
 use crate::video::{self, decode::FrameSlot};
 use crate::voice::Voice;
 use anyhow::{Context, Result, bail};
@@ -12,8 +12,9 @@ use iroh::endpoint::{Connection, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{OnceCell, mpsc};
 
 type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
@@ -21,7 +22,10 @@ type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send
 #[derive(Debug, Clone)]
 pub enum Event {
     Ready,
-    Ticket(String),
+    /// Our current invite link.
+    Ticket { link: String, expires: chrono::DateTime<chrono::Local> },
+    /// Joining failed; we are out of the room again.
+    JoinFailed(String),
     PeerJoined { id: EndpointId, name: String, avatar: Option<Vec<u8>> },
     PeerProfile { id: EndpointId, name: String, avatar: Option<Vec<u8>> },
     PeerLeft { id: EndpointId },
@@ -107,9 +111,97 @@ struct State {
     /// is still the value it started with.
     voice_starting: bool,
     voice_gen: u64,
-    /// Bumped by `leave()`: streams and cameras started in an earlier room
-    /// are discarded when their encoder comes up.
+    /// Bumped on every room change: streams, cameras and connections
+    /// started in an earlier room are discarded when they complete.
     room_gen: u64,
+    invite: Option<Invite>,
+    /// Shared by everyone in the room; proves membership for mesh links.
+    room_secret: Option<[u8; 32]>,
+}
+
+impl State {
+    fn active_invite(&self) -> Option<&Invite> {
+        self.invite.as_ref().filter(|i| Instant::now() < i.valid_until)
+    }
+}
+
+/// Our active invite (one per node).
+struct Invite {
+    token: [u8; 16],
+    /// Monotonic, so changing the system clock doesn't extend it.
+    valid_until: Instant,
+    /// Unix seconds, shown in the link.
+    expires: u32,
+}
+
+const INVITE_TTL: Duration = Duration::from_secs(24 * 3600);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Incoming connections that haven't authenticated yet.
+const MAX_PENDING: usize = 32;
+
+/// The other side refused our credentials.
+#[derive(Debug)]
+struct Denied;
+
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("denied")
+    }
+}
+
+impl std::error::Error for Denied {}
+
+/// Context on errors from setting up the connection itself (before any
+/// authentication), the only ones worth retrying.
+#[derive(Debug)]
+struct ConnectFailed;
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("connect failed")
+    }
+}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+const DIAL_ATTEMPTS: u32 = 3;
+const DIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DIAL_RETRY_WINDOW: Duration = Duration::from_secs(20);
+
+fn alpn_mismatch(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("doesn't support any known protocol")
+}
+
+/// Whether a dial (join or mesh) that failed with `e` after `attempts`
+/// tries is retried.
+fn retry_dial(e: &anyhow::Error, attempts: u32, elapsed: Duration, same_room: bool) -> bool {
+    same_room
+        && attempts < DIAL_ATTEMPTS
+        && elapsed < DIAL_RETRY_WINDOW
+        && e.downcast_ref::<ConnectFailed>().is_some()
+        && !alpn_mismatch(e)
+}
+
+/// What we prove when dialing.
+#[derive(Clone, Copy)]
+enum Cred {
+    Invite([u8; 16]),
+    Member,
+}
+
+/// Counts a pending incoming connection while alive.
+struct Pending<'a>(&'a AtomicUsize);
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn exporter(conn: &Connection) -> Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    conn.export_keying_material(&mut out, b"bibicord/7 auth", b"")
+        .map_err(|e| anyhow::anyhow!("keying material: {e:?}"))?;
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -121,8 +213,8 @@ struct Inner {
     events: Events,
     state: Mutex<State>,
     pub frames: Arc<FrameSlot>,
-    /// This session's invite code; the endpoint key is derived from it.
-    code: String,
+    key: iroh::SecretKey,
+    pending: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -132,11 +224,22 @@ impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let Some(inner) = self.0.upgrade() else { return Ok(()) };
         let node = Node(inner);
-        if !node.0.state.lock().unwrap().in_room {
-            conn.close(2u32.into(), b"not in a room");
+        if node.0.pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
+            node.0.pending.fetch_sub(1, Ordering::SeqCst);
+            conn.close(4u32.into(), b"busy");
             return Ok(());
         }
-        if let Err(e) = node.run_peer(conn, false).await {
+        let pending = Pending(&node.0.pending);
+        let authed = node.accept_auth(&conn).await;
+        drop(pending);
+        let res = match authed {
+            Ok((send, recv, room_gen)) => node.run_peer(conn, false, send, recv, room_gen).await,
+            Err(e) => {
+                conn.close(2u32.into(), b"denied");
+                Err(e)
+            }
+        };
+        if let Err(e) = res {
             tracing::debug!("incoming peer ended: {e:#}");
         }
         Ok(())
@@ -150,14 +253,15 @@ impl std::fmt::Debug for Inner {
 }
 
 impl Node {
-    pub fn new(rt: tokio::runtime::Handle, events: Events) -> Self {
+    pub fn new(rt: tokio::runtime::Handle, events: Events, key: iroh::SecretKey) -> Self {
         let node = Node(Arc::new(Inner {
             rt,
             endpoint: OnceCell::new(),
             events,
             state: Mutex::new(State::default()),
             frames: Arc::new(FrameSlot::default()),
-            code: proto::new_code(),
+            key,
+            pending: AtomicUsize::new(0),
         }));
         let n = node.clone();
         node.0.rt.spawn(async move {
@@ -179,10 +283,8 @@ impl Node {
             .0
             .endpoint
             .get_or_try_init(|| async move {
-                let code = self.0.code.clone();
-                let key = tokio::task::spawn_blocking(move || proto::code_key(&code)).await?;
                 let ep = Endpoint::builder(presets::N0)
-                    .secret_key(key)
+                    .secret_key(self.0.key.clone())
                     .alpns(vec![ALPN.to_vec()])
                     .bind()
                     .await?;
@@ -224,56 +326,133 @@ impl Node {
             s.in_room = true;
             s.name = name;
             s.room = room.clone();
+            s.room_gen += 1;
+            s.room_secret = Some(proto::random32());
         }
         self.emit(Event::RoomName(room));
-        let n = self.clone();
-        self.spawn(async move { n.publish_ticket().await });
+        self.new_invite();
     }
 
-    pub fn join(&self, ticket: &str, name: String) -> Result<()> {
-        let ticket = ticket.trim().to_string();
-        if proto::parse_code(&ticket).is_none() {
-            proto::decode_ticket(&ticket)?; // fails with a readable message
+    pub fn join(&self, link: &str, name: String) -> Result<()> {
+        let invite = proto::parse_invite(link)?;
+        if invite.id == self.0.key.public() {
+            bail!("To Twoje własne zaproszenie");
         }
-        {
+        let room_gen = {
             let mut s = self.0.state.lock().unwrap();
             s.in_room = true;
             s.name = name;
             s.room.clear();
-        }
+            s.room_gen += 1;
+            // Until `Welcome` we have neither: every incoming connection is refused.
+            s.room_secret = None;
+            s.invite = None;
+            s.room_gen
+        };
         let n = self.clone();
         self.spawn(async move {
             n.emit(Event::Status("Łączenie z pokojem…".into()));
-            let addr = match tokio::task::spawn_blocking(move || proto::decode_ticket(&ticket)).await {
-                Ok(Ok(a)) => a,
-                Ok(Err(e)) => return n.emit(Event::Error(format!("Nie udało się dołączyć: {e:#}"))),
-                Err(e) => return n.emit(Event::Error(format!("Nie udało się dołączyć: {e}"))),
-            };
-            if let Err(e) = n.dial(addr).await {
-                tracing::info!("join failed: {e:#}");
-                let msg = if format!("{e:#}").contains("doesn't support any known protocol") {
-                    "Znajomy ma inną wersję BibiCord. Zaktualizujcie aplikację do najnowszej wersji."
-                } else {
-                    "Nie udało się dołączyć. Sprawdź kod i czy osoba, która go wysłała, \
-                     ma otwarty BibiCord."
-                };
-                n.emit(Event::Error(msg.into()));
+            match n.dial_retry(EndpointAddr::from(invite.id), Cred::Invite(invite.token), room_gen).await {
+                Ok(()) => {
+                    if n.0.state.lock().unwrap().room_gen == room_gen {
+                        n.new_invite(); // everyone in a room can invite
+                    }
+                }
+                Err(e) => {
+                    tracing::info!("join failed: {e:#}");
+                    let unix = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let expired = u64::from(invite.expires) <= unix;
+                    let msg = if alpn_mismatch(&e) {
+                        "Znajomy ma inną wersję BibiCord. Zaktualizujcie aplikację do najnowszej wersji."
+                    } else if expired {
+                        "Zaproszenie wygasło. Poproś o nowy link."
+                    } else if e.downcast_ref::<Denied>().is_some() {
+                        "Zaproszenie jest nieważne albo wygasło. Poproś o nowy link."
+                    } else {
+                        "Nie udało się dołączyć. Sprawdź, czy osoba, która wysłała link, ma otwarty BibiCord."
+                    };
+                    if n.leave_if(room_gen) {
+                        n.emit(Event::Status(String::new()));
+                        n.emit(Event::JoinFailed(msg.into()));
+                    }
+                }
             }
-            n.publish_ticket().await;
         });
         Ok(())
     }
 
-    async fn publish_ticket(&self) {
-        let Ok(ep) = self.endpoint().await else { return };
-        // The code resolves via address lookup, which is published once the
-        // endpoint has a home relay.
-        let _ = tokio::time::timeout(Duration::from_secs(8), ep.online()).await;
-        self.emit(Event::Ticket(proto::format_code(&self.0.code)));
+    /// Replaces our invite: the previous link stops working at once.
+    pub fn new_invite(&self) {
+        {
+            let mut s = self.0.state.lock().unwrap();
+            if !s.in_room {
+                return;
+            }
+            let unix = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+            let token: [u8; 16] = proto::random32()[..16].try_into().unwrap();
+            let expires = (unix + INVITE_TTL).as_secs().min(u32::MAX as u64) as u32;
+            s.invite = Some(Invite { token, valid_until: Instant::now() + INVITE_TTL, expires });
+        }
+        self.publish_invite();
+    }
+
+    /// Makes a new invite only if there is none or it expired.
+    pub fn ensure_invite(&self) {
+        if self.valid_invite().is_some() {
+            self.publish_invite();
+        } else {
+            self.new_invite();
+        }
+    }
+
+    /// Token of our invite, if it is still valid.
+    fn valid_invite(&self) -> Option<[u8; 16]> {
+        self.0.state.lock().unwrap().active_invite().map(|i| i.token)
+    }
+
+    /// Makes our invite expire now.
+    #[cfg(test)]
+    fn age_invite(&self) {
+        if let Some(i) = &mut self.0.state.lock().unwrap().invite {
+            i.valid_until = Instant::now();
+        }
+    }
+
+    /// Emits the current link once the endpoint is reachable.
+    fn publish_invite(&self) {
+        let n = self.clone();
+        self.spawn(async move {
+            let Ok(ep) = n.endpoint().await else { return };
+            // Joiners find us via address lookup, which is published once
+            // the endpoint has a home relay.
+            let _ = tokio::time::timeout(Duration::from_secs(8), ep.online()).await;
+            let id = ep.id();
+            let link = {
+                let s = n.0.state.lock().unwrap();
+                let Some(i) = &s.invite else { return };
+                let link = proto::format_invite(&proto::InviteLink { id, token: i.token, expires: i.expires });
+                let expires = chrono::DateTime::from_timestamp(i.expires as i64, 0).unwrap_or_default();
+                (link, expires.with_timezone(&chrono::Local))
+            };
+            n.emit(Event::Ticket { link: link.0, expires: link.1 });
+        });
+    }
+
+    /// `leave()` unless the room changed since `room_gen`.
+    fn leave_if(&self, room_gen: u64) -> bool {
+        let mut s = self.0.state.lock().unwrap();
+        let same = s.room_gen == room_gen;
+        if same {
+            Self::leave_state(&mut s);
+        }
+        same
     }
 
     pub fn leave(&self) {
-        let mut s = self.0.state.lock().unwrap();
+        Self::leave_state(&mut self.0.state.lock().unwrap());
+    }
+
+    fn leave_state(s: &mut State) {
         s.in_room = false;
         s.room.clear();
         for (_, p) in s.peers.drain() {
@@ -292,6 +471,8 @@ impl Node {
         s.voice_starting = false;
         s.voice_gen += 1;
         s.room_gen += 1;
+        s.invite = None;
+        s.room_secret = None;
     }
 
     /// Posts a chat message to everyone in the room; at most `MAX_CHAT_BYTES`.
@@ -340,8 +521,12 @@ impl Node {
         self.broadcast_msg(Msg::Profile { name, avatar });
     }
 
-    fn hello(&self) -> Msg {
+    fn hello(&self, room_gen: u64) -> Option<Msg> {
         let s = self.0.state.lock().unwrap();
+        (s.in_room && s.room_gen == room_gen).then(|| Self::hello_of(&s))
+    }
+
+    fn hello_of(s: &State) -> Msg {
         Msg::Hello {
             name: s.name.clone(),
             room: s.room.clone(),
@@ -362,54 +547,190 @@ impl Node {
         }
     }
 
-    fn dial(&self, addr: EndpointAddr) -> BoxFuture<Result<()>> {
+    fn dial(&self, addr: EndpointAddr, cred: Cred, room_gen: u64) -> BoxFuture<Result<()>> {
         let n = self.clone();
-        Box::pin(async move { n.dial_inner(addr).await })
+        Box::pin(async move { n.dial_inner(addr, cred, room_gen).await })
     }
 
-    async fn dial_inner(&self, addr: EndpointAddr) -> Result<()> {
-        let ep = self.endpoint().await?.clone();
+    /// `dial`, retried while `retry_dial` allows.
+    async fn dial_retry(&self, addr: EndpointAddr, cred: Cred, room_gen: u64) -> Result<()> {
+        let started = Instant::now();
+        let mut attempts = 1;
+        loop {
+            match self.dial(addr.clone(), cred, room_gen).await {
+                Err(e) if retry_dial(&e, attempts, started.elapsed(), self.0.state.lock().unwrap().room_gen == room_gen) => {
+                    tracing::info!("dial {} attempt {attempts} failed, retrying: {e:#}", addr.id);
+                    attempts += 1;
+                    tokio::time::sleep(DIAL_RETRY_DELAY).await;
+                }
+                res => return res,
+            }
+        }
+    }
+
+    /// Connects and authenticates for the room `room_gen`; the rest of the
+    /// session runs in the background. Fails with `Denied` if the other side
+    /// refused us, with `ConnectFailed` if we couldn't reach it.
+    async fn dial_inner(&self, addr: EndpointAddr, cred: Cred, room_gen: u64) -> Result<()> {
         let id = addr.id;
-        if id == ep.id() {
+        if id == self.0.key.public() {
+            if let Cred::Invite(_) = cred {
+                bail!("own invite");
+            }
             return Ok(());
         }
         {
             let mut s = self.0.state.lock().unwrap();
+            if !s.in_room || s.room_gen != room_gen {
+                bail!("room changed");
+            }
             if s.peers.contains_key(&id) || !s.dialing.insert(id) {
                 return Ok(());
             }
         }
-        let res = tokio::time::timeout(Duration::from_secs(25), ep.connect(addr, ALPN)).await;
+        let res = async {
+            let ep = self.endpoint().await?.clone();
+            let conn = match tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => return Err(anyhow::Error::from(e).context(ConnectFailed)),
+                Err(e) => return Err(anyhow::Error::from(e).context(ConnectFailed)),
+            };
+            match tokio::time::timeout(AUTH_TIMEOUT, self.dial_auth(&conn, cred, room_gen)).await {
+                Ok(Ok((send, recv))) => Ok((conn, send, recv)),
+                Ok(Err(e)) => {
+                    conn.close(2u32.into(), b"auth");
+                    Err(e)
+                }
+                Err(e) => {
+                    conn.close(2u32.into(), b"auth");
+                    Err(e.into())
+                }
+            }
+        }
+        .await;
         self.0.state.lock().unwrap().dialing.remove(&id);
-        let conn = res.context("przekroczono czas")??;
+        let (conn, send, recv) = res?;
         let n = self.clone();
         self.spawn(async move {
-            if let Err(e) = n.run_peer(conn, true).await {
+            if let Err(e) = n.run_peer(conn, true, send, recv, room_gen).await {
                 tracing::debug!("outgoing peer ended: {e:#}");
             }
         });
         Ok(())
     }
 
-    async fn run_peer(&self, conn: Connection, dialed: bool) -> Result<()> {
-        let ep = self.endpoint().await?.clone();
-        let me = ep.id();
-        let remote = conn.remote_id();
+    /// Caller side: `Auth`, then check the callee's proof in `Welcome`.
+    async fn dial_auth(
+        &self,
+        conn: &Connection,
+        cred: Cred,
+        room_gen: u64,
+    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+        let (me, remote) = (self.endpoint().await?.id(), conn.remote_id());
+        let ex = exporter(conn)?;
+        let key = match cred {
+            Cred::Invite(token) => proto::invite_key(&token),
+            Cred::Member => {
+                let s = self.0.state.lock().unwrap();
+                match s.room_secret {
+                    Some(secret) if s.room_gen == room_gen => proto::room_key(&secret),
+                    _ => bail!("not in this room"),
+                }
+            }
+        };
+        let proof = proto::proof(&key, proto::ROLE_CALLER, &ex, &me, &remote);
+        let auth = match cred {
+            Cred::Invite(_) => Auth::Invite { proof },
+            Cred::Member => Auth::Member { proof },
+        };
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(&[TAG_CONTROL]).await?;
+        proto::write_msg(&mut send, &Msg::Auth(auth)).await?;
+        let (theirs, secret) = match proto::read_msg(&mut recv).await? {
+            Msg::Welcome { proof, room_secret } => (proof, room_secret),
+            Msg::Denied => return Err(Denied.into()),
+            _ => bail!("expected welcome"),
+        };
+        if !proto::proof_eq(&theirs, &proto::proof(&key, proto::ROLE_CALLEE, &ex, &me, &remote)) {
+            bail!("bad welcome proof");
+        }
+        if let Cred::Invite(_) = cred {
+            let secret = secret.context("no room secret")?;
+            let mut s = self.0.state.lock().unwrap();
+            if !s.in_room || s.room_gen != room_gen {
+                bail!("left while joining");
+            }
+            s.room_secret = Some(secret);
+        }
+        Ok((send, recv))
+    }
 
-        let (mut send, mut recv) = if dialed {
-            let (mut s, r) = conn.open_bi().await?;
-            s.write_all(&[TAG_CONTROL]).await?;
-            (s, r)
-        } else {
-            let (s, mut r) = tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await??;
+    /// Callee side: checks `Auth` before anything about the room is sent.
+    /// Returns the control stream and the room it was checked against.
+    async fn accept_auth(
+        &self,
+        conn: &Connection,
+    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream, u64)> {
+        let (me, remote) = (self.endpoint().await?.id(), conn.remote_id());
+        let ex = exporter(conn)?;
+        let (mut send, recv, auth) = tokio::time::timeout(AUTH_TIMEOUT, async {
+            let (s, mut r) = conn.accept_bi().await?;
             let mut tag = [0u8];
             r.read_exact(&mut tag).await?;
             if tag[0] != TAG_CONTROL {
                 bail!("unexpected first stream");
             }
-            (s, r)
+            let msg = proto::read_msg(&mut r).await?;
+            anyhow::Ok((s, r, msg))
+        })
+        .await??;
+        let checked = {
+            let s = self.0.state.lock().unwrap();
+            let ok = |key: [u8; 32], proof: &[u8; 32]| {
+                proto::proof_eq(proof, &proto::proof(&key, proto::ROLE_CALLER, &ex, &remote, &me)).then_some(key)
+            };
+            match (&auth, s.active_invite(), s.room_secret) {
+                (Msg::Auth(Auth::Invite { proof }), Some(i), Some(secret)) if s.in_room => {
+                    ok(proto::invite_key(&i.token), proof).map(|k| (k, Some(secret), s.room_gen))
+                }
+                (Msg::Auth(Auth::Member { proof }), _, Some(secret)) if s.in_room => {
+                    ok(proto::room_key(&secret), proof).map(|k| (k, None, s.room_gen))
+                }
+                _ => None,
+            }
         };
-        proto::write_msg(&mut send, &self.hello()).await?;
+        let Some((key, room_secret, room_gen)) = checked else {
+            let _ = proto::write_msg(&mut send, &Msg::Denied).await;
+            let _ = send.finish();
+            // Give `Denied` a moment to arrive; the caller closes on it.
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
+            bail!("denied {remote}");
+        };
+        let proof = proto::proof(&key, proto::ROLE_CALLEE, &ex, &remote, &me);
+        proto::write_msg(&mut send, &Msg::Welcome { proof, room_secret }).await?;
+        Ok((send, recv, room_gen))
+    }
+
+    /// An authenticated connection: exchanges `Hello`, then runs until it
+    /// closes. `room_gen` is the room the other side proved to belong to.
+    async fn run_peer(
+        &self,
+        conn: Connection,
+        dialed: bool,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+        room_gen: u64,
+    ) -> Result<()> {
+        let me = self.0.key.public();
+        let remote = conn.remote_id();
+        // Not a word about a room the other side didn't prove to be in.
+        // The caller speaks first. The callee answers with a `Hello` built
+        // under the lock that adds the caller to `peers`, so of two
+        // simultaneous joiners the later one always hears of the earlier.
+        if dialed {
+            let hello = self.hello(room_gen).context("room changed")?;
+            proto::write_msg(&mut send, &hello).await?;
+        }
         let Msg::Hello { name, room, peers, stream, camera, voice, muted, deafened, avatar } =
             tokio::time::timeout(Duration::from_secs(15), proto::read_msg(&mut recv)).await??
         else {
@@ -421,15 +742,17 @@ impl Node {
         let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
         let stable = conn.stable_id();
         let mut adopted_room = None;
-        {
+        let reply = {
             let mut s = self.0.state.lock().unwrap();
+            // Authenticated for an earlier room (e.g. we left and made a new
+            // one while this `Hello` was held back): not a member here.
+            if !s.in_room || s.room_gen != room_gen {
+                conn.close(2u32.into(), b"left");
+                return Ok(());
+            }
             if s.room.is_empty() && !room.is_empty() {
                 s.room = room.clone();
                 adopted_room = Some(room);
-            }
-            if !s.in_room {
-                conn.close(2u32.into(), b"left");
-                return Ok(());
             }
             // Both sides may dial each other at the same time. Keep exactly
             // one connection: the one dialed by the smaller id.
@@ -443,6 +766,8 @@ impl Node {
                     return Ok(());
                 }
             }
+            // Before the insert: our peer list doesn't name the caller.
+            let reply = (!dialed).then(|| Self::hello_of(&s));
             s.peers.insert(
                 remote,
                 PeerConn {
@@ -455,6 +780,14 @@ impl Node {
                     camera: None,
                 },
             );
+            reply
+        };
+        // Sent before the writer starts, so it comes first. On failure the
+        // reader below ends at once and cleans up.
+        if let Some(hello) = reply
+            && proto::write_msg(&mut send, &hello).await.is_err()
+        {
+            conn.close(2u32.into(), b"hello");
         }
         if let Some(room) = adopted_room {
             self.emit(Event::RoomName(room));
@@ -470,7 +803,7 @@ impl Node {
             if p != me {
                 let n = self.clone();
                 self.spawn(async move {
-                    if let Err(e) = n.dial(EndpointAddr::new(p)).await {
+                    if let Err(e) = n.dial_retry(EndpointAddr::new(p), Cred::Member, room_gen).await {
                         tracing::debug!("mesh dial {p}: {e:#}");
                     }
                 });
@@ -579,7 +912,7 @@ impl Node {
                     }
                     self.emit(Event::PeerProfile { id: remote, name, avatar });
                 }
-                Msg::Hello { .. } => {}
+                Msg::Hello { .. } | Msg::Auth(_) | Msg::Denied | Msg::Welcome { .. } => {}
             }
         }
 
@@ -1029,7 +1362,7 @@ mod tests {
     fn node() -> (Node, std::sync::mpsc::Receiver<Event>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ev = Events::new(tx, eframe::egui::Context::default());
-        (Node::new(tokio::runtime::Handle::current(), ev), rx)
+        (Node::new(tokio::runtime::Handle::current(), ev, iroh::SecretKey::generate()), rx)
     }
 
     async fn wait_for(
@@ -1150,7 +1483,7 @@ mod tests {
         let (a, arx) = node();
         let (b, brx) = node();
         a.create_room("Ala".into(), "Test".into());
-        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+        let Event::Ticket { link: t, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
             unreachable!()
         };
         b.join(&t, "Bob".into()).unwrap();
@@ -1181,7 +1514,7 @@ mod tests {
         let (a, arx) = node();
         let (b, brx) = node();
         a.create_room("Ala".into(), "Test".into());
-        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+        let Event::Ticket { link: t, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
             unreachable!()
         };
         b.join(&t, "Bob".into()).unwrap();
@@ -1245,7 +1578,7 @@ mod tests {
         let (a, arx) = node();
         let (b, brx) = node();
         a.create_room("Ala".into(), "Test".into());
-        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+        let Event::Ticket { link: t, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
             unreachable!()
         };
         b.join(&t, "Bob".into()).unwrap();
@@ -1275,6 +1608,471 @@ mod tests {
         b.leave();
     }
 
+    /// Invites without the network: rotation, expiry, cleanup on leave.
+    #[tokio::test]
+    async fn invite_lifecycle() {
+        let (a, _rx) = node();
+        a.new_invite();
+        assert!(a.valid_invite().is_none(), "no invite outside a room");
+        a.create_room("Ala".into(), "A".into());
+        let t1 = a.valid_invite().unwrap();
+        assert!(a.0.state.lock().unwrap().room_secret.is_some());
+        a.ensure_invite();
+        assert_eq!(a.valid_invite(), Some(t1), "a valid invite is kept");
+        a.new_invite();
+        let t2 = a.valid_invite().unwrap();
+        assert_ne!(t1, t2);
+        a.age_invite();
+        assert!(a.valid_invite().is_none(), "expired");
+        a.ensure_invite();
+        assert!(a.valid_invite().is_some_and(|t| t != t2));
+        a.leave();
+        let s = a.0.state.lock().unwrap();
+        assert!(s.invite.is_none() && s.room_secret.is_none());
+    }
+
+    /// Only failures to reach the other side (inviter or mesh peer) are
+    /// retried, a few times, early.
+    #[test]
+    fn retry_dial_decision() {
+        let connect = || anyhow::anyhow!("no addressing information").context(ConnectFailed);
+        let s = Duration::from_secs(1);
+        assert!(retry_dial(&connect(), 1, s, true));
+        assert!(retry_dial(&connect(), 2, s, true));
+        assert!(!retry_dial(&connect(), 3, s, true), "3 attempts at most");
+        assert!(!retry_dial(&connect(), 1, Duration::from_secs(20), true), "too late");
+        assert!(!retry_dial(&connect(), 1, s, false), "room changed");
+        let alpn = anyhow::anyhow!("peer doesn't support any known protocol").context(ConnectFailed);
+        assert!(!retry_dial(&alpn, 1, s, true), "ALPN mismatch");
+        assert!(!retry_dial(&anyhow::Error::from(Denied), 1, s, true), "denied");
+        assert!(!retry_dial(&anyhow::anyhow!("bad welcome proof"), 1, s, true), "bad welcome");
+        assert!(!retry_dial(&anyhow::anyhow!("expected hello"), 1, s, true), "after auth");
+    }
+
+    /// A dial started for an earlier room is refused before connecting.
+    #[tokio::test]
+    async fn dial_stale_room() {
+        let (a, _rx) = node();
+        a.create_room("Ala".into(), "Pokój 1".into());
+        let old = a.0.state.lock().unwrap().room_gen;
+        a.leave();
+        a.create_room("Ala".into(), "Pokój 2".into());
+        let secret = a.0.state.lock().unwrap().room_secret;
+        let to = EndpointAddr::from(iroh::SecretKey::generate().public());
+        for cred in [Cred::Invite([1; 16]), Cred::Member] {
+            let res = tokio::time::timeout(Duration::from_secs(2), a.dial(to.clone(), cred, old)).await.expect("connected");
+            assert_eq!(res.unwrap_err().to_string(), "room changed");
+        }
+        let s = a.0.state.lock().unwrap();
+        assert_eq!(s.room_secret, secret);
+        assert!(s.dialing.is_empty());
+    }
+
+    /// Our own link is recognised before the endpoint is up.
+    #[tokio::test]
+    async fn join_own_link() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let key = iroh::SecretKey::generate();
+        let a = Node::new(tokio::runtime::Handle::current(), Events::new(tx, eframe::egui::Context::default()), key.clone());
+        let link = proto::format_invite(&proto::InviteLink { id: key.public(), token: [1; 16], expires: u32::MAX });
+        assert_eq!(a.join(&link, "Ala".into()).unwrap_err().to_string(), "To Twoje własne zaproszenie");
+        assert!(!a.0.state.lock().unwrap().in_room);
+        a.create_room("Ala".into(), "A".into());
+        let room_gen = a.0.state.lock().unwrap().room_gen;
+        let res = a.dial(EndpointAddr::from(key.public()), Cred::Invite([1; 16]), room_gen).await;
+        assert!(res.is_err());
+    }
+
+    // ------------------------------------------------ invites over the network
+
+    async fn ticket(rx: &std::sync::mpsc::Receiver<Event>) -> String {
+        let Event::Ticket { link, .. } = wait_for(rx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
+            unreachable!()
+        };
+        link
+    }
+
+    /// Joins and waits until `b` has met the inviter.
+    async fn join_ok(b: &Node, rx: &std::sync::mpsc::Receiver<Event>, link: &str) {
+        b.join(link, "Bob".into()).unwrap();
+        let e = wait_for(rx, 40, |e| matches!(e, Event::PeerJoined { .. } | Event::JoinFailed(_))).await;
+        assert!(matches!(e, Event::PeerJoined { .. }), "{e:?}");
+    }
+
+    async fn join_fails(b: &Node, rx: &std::sync::mpsc::Receiver<Event>, link: &str) -> String {
+        b.join(link, "Bob".into()).unwrap();
+        let e = wait_for(rx, 40, |e| matches!(e, Event::PeerJoined { .. } | Event::JoinFailed(_))).await;
+        let Event::JoinFailed(msg) = e else { panic!("joined: {e:?}") };
+        assert!(!b.0.state.lock().unwrap().in_room, "left after a failed join");
+        msg
+    }
+
+    async fn raw_endpoint() -> Endpoint {
+        let ep = Endpoint::builder(presets::N0)
+            .secret_key(iroh::SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(8), ep.online()).await;
+        ep
+    }
+
+    /// A hand-written peer: control stream opened, nothing sent yet.
+    struct Raw {
+        conn: Connection,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+        ex: [u8; 32],
+        me: EndpointId,
+        to: EndpointId,
+    }
+
+    impl Raw {
+        async fn dial(ep: &Endpoint, to: EndpointId) -> Raw {
+            let conn = tokio::time::timeout(Duration::from_secs(30), ep.connect(EndpointAddr::from(to), ALPN))
+                .await
+                .unwrap()
+                .unwrap();
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            send.write_all(&[TAG_CONTROL]).await.unwrap();
+            let ex = exporter(&conn).unwrap();
+            Raw { conn, send, recv, ex, me: ep.id(), to }
+        }
+
+        fn member(&self, secret: &[u8; 32]) -> Msg {
+            let proof = proto::proof(&proto::room_key(secret), proto::ROLE_CALLER, &self.ex, &self.me, &self.to);
+            Msg::Auth(Auth::Member { proof })
+        }
+
+        fn invite(&self, token: &[u8; 16]) -> Msg {
+            let proof = proto::proof(&proto::invite_key(token), proto::ROLE_CALLER, &self.ex, &self.me, &self.to);
+            Msg::Auth(Auth::Invite { proof })
+        }
+
+        async fn send(&mut self, m: &Msg) {
+            let _ = proto::write_msg(&mut self.send, m).await;
+        }
+
+        /// Next message, or `None` if the stream closed or stayed silent.
+        async fn reply(&mut self) -> Option<Msg> {
+            self.reply_within(Duration::from_secs(10)).await
+        }
+
+        async fn reply_within(&mut self, t: Duration) -> Option<Msg> {
+            tokio::time::timeout(t, proto::read_msg(&mut self.recv)).await.ok()?.ok()
+        }
+    }
+
+    fn fake_hello() -> Msg {
+        Msg::Hello {
+            name: "Mallory".into(),
+            room: String::new(),
+            peers: vec![],
+            stream: None,
+            camera: None,
+            voice: false,
+            muted: false,
+            deafened: false,
+            avatar: None,
+        }
+    }
+
+    /// `id` never made it into `a`'s room.
+    async fn assert_outside(a: &Node, rx: &std::sync::mpsc::Receiver<Event>, id: EndpointId) {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!a.0.state.lock().unwrap().peers.contains_key(&id), "in peers");
+        assert!(!rx.try_iter().any(|e| matches!(e, Event::PeerJoined { id: j, .. } if j == id)), "PeerJoined");
+    }
+
+    /// Joining by link works; the link names exactly the inviter.
+    /// Run the invite tests with: cargo test e2e_invite -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_join() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let link = ticket(&arx).await;
+        assert_eq!(Some(proto::parse_invite(&link).unwrap().id), a.my_id());
+        join_ok(&b, &brx, &link).await;
+        wait_for(&arx, 10, |e| matches!(e, Event::PeerJoined { name, .. } if name == "Bob")).await;
+        assert_eq!(b.0.state.lock().unwrap().room_secret, a.0.state.lock().unwrap().room_secret);
+        a.leave();
+        b.leave();
+    }
+
+    /// (#2) A link to an earlier room doesn't open a later one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_old_room() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Pokój 1".into());
+        let l1 = ticket(&arx).await;
+        a.leave();
+        a.create_room("Ala".into(), "Pokój 2".into());
+        ticket(&arx).await;
+        let msg = join_fails(&b, &brx, &l1).await;
+        assert!(msg.contains("nieważne"), "{msg}");
+        assert!(a.0.state.lock().unwrap().peers.is_empty());
+        a.leave();
+    }
+
+    /// Knowing someone's id is not enough: no proof, a wrong room secret or
+    /// a wrong token get `Denied` and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_required() {
+        let (a, arx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        ticket(&arx).await;
+        let ep = raw_endpoint().await;
+        for case in 0..3 {
+            let mut r = Raw::dial(&ep, a.my_id().unwrap()).await;
+            let m = match case {
+                0 => fake_hello(),
+                1 => r.member(&proto::random32()),
+                _ => r.invite(&[5; 16]),
+            };
+            r.send(&m).await;
+            let got = r.reply().await;
+            assert!(matches!(got, None | Some(Msg::Denied)), "case {case}: {got:?}");
+            assert!(r.reply().await.is_none(), "case {case}: more after Denied");
+            assert_outside(&a, &arx, ep.id()).await;
+            r.conn.close(0u32.into(), b"");
+        }
+        a.leave();
+    }
+
+    /// A former member's room secret doesn't open the next room.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_former_member() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Pokój 1".into());
+        join_ok(&b, &brx, &ticket(&arx).await).await;
+        let old = b.0.state.lock().unwrap().room_secret.unwrap();
+        b.leave();
+        a.leave();
+        a.create_room("Ala".into(), "Pokój 2".into());
+        ticket(&arx).await;
+        let ep = raw_endpoint().await;
+        let mut r = Raw::dial(&ep, a.my_id().unwrap()).await;
+        let m = r.member(&old);
+        r.send(&m).await;
+        let got = r.reply().await;
+        assert!(matches!(got, None | Some(Msg::Denied)), "{got:?}");
+        assert_outside(&a, &arx, ep.id()).await;
+        a.leave();
+    }
+
+    /// Authenticated for one room, `Hello` held back until the victim is in
+    /// a new room: not let in.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_held_hello() {
+        let (a, arx) = node();
+        a.create_room("Ala".into(), "Pokój 1".into());
+        ticket(&arx).await;
+        let secret = a.0.state.lock().unwrap().room_secret.unwrap();
+        let ep = raw_endpoint().await;
+        let mut r = Raw::dial(&ep, a.my_id().unwrap()).await;
+        let m = r.member(&secret);
+        r.send(&m).await;
+        assert!(matches!(r.reply().await, Some(Msg::Welcome { room_secret: None, .. })));
+        // The callee waits for our `Hello` before saying anything.
+        let got = r.reply_within(Duration::from_secs(2)).await;
+        assert!(got.is_none(), "{got:?}");
+        a.leave();
+        a.create_room("Ala".into(), "Pokój 2".into());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        r.send(&fake_hello()).await;
+        let got = r.reply_within(Duration::from_secs(3)).await;
+        assert!(!matches!(&got, Some(Msg::Hello { room, .. }) if room == "Pokój 2"), "{got:?}");
+        assert!(got.is_none(), "{got:?}");
+        assert_outside(&a, &arx, ep.id()).await;
+        a.leave();
+    }
+
+    /// A new link revokes the previous one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_revoked() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let l1 = ticket(&arx).await;
+        a.new_invite();
+        let l2 = ticket(&arx).await;
+        assert_ne!(l1, l2);
+        let msg = join_fails(&b, &brx, &l1).await;
+        assert!(msg.contains("nieważne"), "{msg}");
+        join_ok(&b, &brx, &l2).await;
+        a.leave();
+        b.leave();
+    }
+
+    /// An expired invite is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_expired() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let link = ticket(&arx).await;
+        a.age_invite();
+        let msg = join_fails(&b, &brx, &link).await;
+        assert!(msg.contains("nieważne"), "{msg}");
+        assert!(a.0.state.lock().unwrap().peers.is_empty());
+        a.leave();
+    }
+
+    /// C joins with B's link and still meets A: the A–C link is
+    /// authenticated with the room secret.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_mesh() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        let (c, crx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        join_ok(&b, &brx, &ticket(&arx).await).await;
+        // B made its own invite after joining; its `Ticket` may have been
+        // passed over while waiting for `PeerJoined`, so ask again.
+        let t = Instant::now();
+        while b.valid_invite().is_none() {
+            assert!(t.elapsed() < Duration::from_secs(5), "no invite after joining");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        b.ensure_invite();
+        let lb = ticket(&brx).await;
+        assert_eq!(Some(proto::parse_invite(&lb).unwrap().id), b.my_id());
+        c.join(&lb, "Cyryl".into()).unwrap();
+        let mut seen = HashSet::new();
+        while seen.len() < 2 {
+            let Event::PeerJoined { name, .. } = wait_for(&crx, 40, |e| matches!(e, Event::PeerJoined { .. })).await else {
+                unreachable!()
+            };
+            seen.insert(name);
+        }
+        assert_eq!(seen, HashSet::from(["Ala".to_string(), "Bob".to_string()]));
+        wait_for(&arx, 20, |e| matches!(e, Event::PeerJoined { name, .. } if name == "Cyryl")).await;
+        assert!(a.0.state.lock().unwrap().peers.contains_key(&c.my_id().unwrap()));
+        for n in [a, b, c] {
+            n.leave();
+        }
+    }
+
+    /// Waits until `rx` has seen `PeerJoined` for every name in `names`.
+    async fn wait_joined(rx: &std::sync::mpsc::Receiver<Event>, names: &[&str]) {
+        let mut seen = HashSet::new();
+        while !names.iter().all(|n| seen.contains(*n)) {
+            let Event::PeerJoined { name, .. } = wait_for(rx, 40, |e| matches!(e, Event::PeerJoined { .. })).await else {
+                unreachable!()
+            };
+            seen.insert(name);
+        }
+    }
+
+    /// B and C join with A's link at the same time: all three meet.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_simultaneous() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        let (c, crx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let link = ticket(&arx).await;
+        b.join(&link, "Bob".into()).unwrap();
+        c.join(&link, "Cyryl".into()).unwrap();
+        wait_joined(&arx, &["Bob", "Cyryl"]).await;
+        wait_joined(&brx, &["Ala", "Cyryl"]).await;
+        wait_joined(&crx, &["Ala", "Bob"]).await;
+        for n in [&a, &b, &c] {
+            assert_eq!(n.0.state.lock().unwrap().peers.len(), 2);
+        }
+        for n in [a, b, c] {
+            n.leave();
+        }
+    }
+
+    /// Connections that never authenticate are capped; past the cap new
+    /// ones are closed at once, and once they go a normal join works.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_pending_limit() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let link = ticket(&arx).await;
+        let to = EndpointAddr::from(a.my_id().unwrap());
+        let ep = raw_endpoint().await;
+        let connect = || async {
+            tokio::time::timeout(Duration::from_secs(30), ep.connect(to.clone(), ALPN)).await.unwrap()
+        };
+        let start = Instant::now();
+        let mut silent = vec![connect().await.unwrap()];
+        let t = Instant::now();
+        for _ in 1..MAX_PENDING {
+            silent.push(connect().await.unwrap());
+        }
+        while a.0.pending.load(Ordering::SeqCst) < MAX_PENDING {
+            assert!(t.elapsed() < Duration::from_secs(5), "pending: {}", a.0.pending.load(Ordering::SeqCst));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let t = Instant::now();
+        if let Ok(extra) = connect().await {
+            let closed = tokio::time::timeout(Duration::from_secs(5), extra.closed()).await;
+            assert!(closed.is_ok(), "connection over the limit kept open");
+        }
+        // Well before the first silent ones time out on their own.
+        assert!(start.elapsed() < AUTH_TIMEOUT - Duration::from_secs(3), "{:?}", start.elapsed());
+        tracing::info!("over the limit closed in {:?}", t.elapsed());
+        for c in &silent {
+            c.close(0u32.into(), b"");
+        }
+        let t = Instant::now();
+        while a.0.pending.load(Ordering::SeqCst) > 0 {
+            assert!(t.elapsed() < Duration::from_secs(5), "pending left");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        join_ok(&b, &brx, &link).await;
+        a.leave();
+        b.leave();
+    }
+
+    /// We check the callee too: a `Welcome` with a wrong proof gets no
+    /// `Hello`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_invite_bad_welcome() {
+        let srv = raw_endpoint().await;
+        let srv_id = srv.id();
+        let server = tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(40), srv.accept()).await.unwrap().unwrap().await.unwrap();
+            let (mut s, mut r) = conn.accept_bi().await.unwrap();
+            let mut tag = [0u8];
+            r.read_exact(&mut tag).await.unwrap();
+            let auth = proto::read_msg(&mut r).await.unwrap();
+            assert!(matches!(auth, Msg::Auth(Auth::Member { .. })), "{auth:?}");
+            proto::write_msg(&mut s, &Msg::Welcome { proof: [9; 32], room_secret: None }).await.unwrap();
+            let next = tokio::time::timeout(Duration::from_secs(5), proto::read_msg(&mut r)).await;
+            matches!(next, Ok(Ok(Msg::Hello { .. })))
+        });
+        let (b, brx) = node();
+        b.create_room("Bob".into(), "Test".into());
+        ticket(&brx).await;
+        let room_gen = b.0.state.lock().unwrap().room_gen;
+        let res = b.dial(EndpointAddr::from(srv_id), Cred::Member, room_gen).await;
+        assert!(res.is_err(), "accepted a bad Welcome");
+        let hello = tokio::time::timeout(Duration::from_secs(60), server).await.unwrap().unwrap();
+        assert!(!hello, "sent Hello after a bad Welcome");
+        assert!(b.0.state.lock().unwrap().peers.is_empty());
+        b.leave();
+    }
+
     /// Files in chat over the real network: everyone in the room gets the
     /// exact bytes, too large files are refused by the sender and dropped by
     /// the receiver without losing the connection.
@@ -1286,7 +2084,7 @@ mod tests {
         let (b, brx) = node();
         let (c, crx) = node();
         a.create_room("Ala".into(), "Test".into());
-        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+        let Event::Ticket { link: t, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
             unreachable!()
         };
         b.join(&t, "Bob".into()).unwrap();
@@ -1343,7 +2141,7 @@ mod tests {
         let pic = vec![7u8; 1000];
         a.set_avatar(Some(pic.clone()));
         a.create_room("Ala".into(), "Test".into());
-        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+        let Event::Ticket { link: t, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
             unreachable!()
         };
         b.join(&t, "Bob".into()).unwrap();
@@ -1459,7 +2257,7 @@ mod tests {
         let (a, arx) = node();
         let (b, brx) = node();
         a.create_room("Ala".into(), "Test".into());
-        let Event::Ticket(t) = wait_for(&arx, 20, |e| matches!(e, Event::Ticket(_))).await else {
+        let Event::Ticket { link: t, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
             unreachable!()
         };
         b.join(&t, "Bob".into()).unwrap();

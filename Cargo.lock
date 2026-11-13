@@ -600,6 +600,7 @@ dependencies = [
  "bytes",
  "chrono",
  "cpal",
+ "data-encoding",
  "directories",
  "eframe",
  "egui-pop-phosphor",
