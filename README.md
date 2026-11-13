@@ -50,8 +50,11 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
   Nie ma własnego serwera. Publiczne relaye n0 służą tylko do zestawienia
   połączenia, a gdy bezpośrednie połączenie jest niemożliwe, przenoszą
   zaszyfrowany ruch. Przy każdej osobie widać, czy łączysz się `P2P`, czy przez `relay`.
-- **Pokój = zaproszenie.** Tworzysz pokój, klikasz „zaproś”, a tekst
-  zaproszenia wysyłasz znajomym. Kto dołączy, sam połączy się z pozostałymi.
+- **Pokój = zaproszenie.** Tworzysz pokój, klikasz „Zaproś” i wysyłasz znajomym
+  link `bibicord://join/…`. Znajomy wkleja go na ekranie startowym i klika
+  „Dołącz”, a potem sam łączy się z pozostałymi. Link działa 24 godziny albo do
+  Twojego wyjścia z pokoju; „Nowy link” od razu unieważnia poprzedni. Każdy
+  uczestnik może zapraszać własnym linkiem.
 - **Stream w jakości źródła.** Ekran jest przechwytywany natywnie
   (Windows: Desktop Duplication; macOS: ScreenCaptureKit), kodowany
   **sprzętowo jeden raz** (NVENC / AMF / QuickSync / Media Foundation /
@@ -171,12 +174,32 @@ wszystkie dźwięki, a `BIBICORD_SOUNDS_OUT=<katalog> cargo test export_wavs -- 
 zapisuje je jako WAV.
 Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 
+## Bezpieczeństwo zaproszeń
+
+- Tożsamość urządzenia to losowy klucz w pliku `identity.key` w katalogu
+  danych aplikacji (na Unixie z prawami `0600`). Nie wynika z żadnego
+  zaproszenia, więc znajomość linku nie pozwala podszyć się pod jego autora.
+  `BIBICORD_EPHEMERAL_ID=1` (oraz uruchomienia demo) używa klucza tylko na
+  jedną sesję.
+- Link zawiera klucz publiczny zapraszającego (to jego adres) i losowy token
+  ważny 24 godziny. Token nie jest przesyłany: dołączający udowadnia, że go
+  zna, dowodem związanym z daną sesją TLS.
+- Każdy pokój ma losowy sekret, który nowy uczestnik dostaje po udanym
+  dołączeniu. Połączenia w siatce pokoju udowadniają znajomość sekretu.
+  Bez ważnego tokenu albo sekretu połączenie jest odrzucane, zanim padnie
+  jakakolwiek informacja o pokoju (nazwa, uczestnicy, awatary). Dowód jest
+  wzajemny: dzwoniący sprawdza też drugą stronę.
+- Po wyjściu z pokoju jego link i sekret przestają działać; nowy pokój ma nowe.
+  Sekretu nie da się dziś zmienić w trakcie trwania pokoju, więc były
+  uczestnik może wrócić do tego samego pokoju, dopóki on trwa.
+
 ## Struktura
 
 | Plik | Rola |
 |---|---|
 | `src/net.rs` | pokój P2P (siatka połączeń iroh), czat, sygnalizacja, przesyłanie wideo i głosu |
-| `src/proto.rs` | protokół i zaproszenia |
+| `src/proto.rs` | protokół, linki zaproszeń i dowody uwierzytelnienia |
+| `src/identity.rs` | stała tożsamość urządzenia (`identity.key`) |
 | `src/video/encode.rs` | przechwytywanie ekranu i wybór enkodera sprzętowego |
 | `src/video/hub.rs` | rozsyłanie strumienia do widzów (klatki kluczowe, wolni widzowie) |
 | `src/video/decode.rs` | dekodowanie sprzętowe do RGBA |

@@ -140,7 +140,7 @@ impl App {
             let resp = w::text_field(
                 ui,
                 &mut self.ticket_input,
-                "np. K7QX-3MFA-9TZP",
+                "Wklej link zaproszenia",
                 "start_ticket",
                 width - join_w - sp::S,
             );
@@ -165,11 +165,15 @@ impl App {
             self.name = self.name.trim().to_string();
             match self.node.join(&self.ticket_input, self.name.clone()) {
                 Ok(()) => {
-                    self.ticket_input.clear();
                     self.join_error = None;
                     self.enter_room();
                 }
-                Err(e) => self.join_error = Some(format!("{e:#}. Sprawdź, czy skopiowano cały kod.")),
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    // Only a garbled link can be fixed by copying it again.
+                    let hint = if e == crate::proto::NOT_AN_INVITE { " Sprawdź, czy skopiowano cały link." } else { "" };
+                    self.join_error = Some(format!("{e}.{hint}"));
+                }
             }
         }
 

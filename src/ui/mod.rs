@@ -83,6 +83,7 @@ pub struct App {
     pub(crate) ticket_input: String,
     pub(crate) join_error: Option<String>,
     pub(crate) ticket: Option<String>,
+    pub(crate) ticket_expires: Option<chrono::DateTime<chrono::Local>>,
     pub(crate) copied: Option<(&'static str, Instant)>,
     pub(crate) room: String,
     pub(crate) my_id: Option<EndpointId>,
@@ -135,7 +136,11 @@ impl App {
         theme::install(&cc.egui_ctx);
         let (tx, rx) = std::sync::mpsc::channel();
         let events = Events::new(tx, cc.egui_ctx.clone());
-        let node = Node::new(rt, events);
+        let demo = crate::demo::Demo::from_env();
+        // Two instances on one account (demo runs) need different identities.
+        let ephemeral = demo.is_some() || std::env::var_os("BIBICORD_EPHEMERAL_ID").is_some();
+        let key = if ephemeral { iroh::SecretKey::generate() } else { crate::identity::load_or_create() };
+        let node = Node::new(rt, events, key);
         node.set_voice_prefs(crate::voice::Prefs::load());
 
         let ffmpeg_status = Arc::new(Mutex::new("Przygotowywanie FFmpeg…".to_string()));
@@ -177,6 +182,7 @@ impl App {
             ticket_input: String::new(),
             join_error: None,
             ticket: None,
+            ticket_expires: None,
             copied: None,
             room: String::new(),
             my_id: None,
@@ -209,7 +215,7 @@ impl App {
             update: Default::default(),
             sounds: crate::sounds::Player::new(),
             update_checked: None,
-            demo: crate::demo::Demo::from_env(),
+            demo,
         }
     }
 
@@ -251,7 +257,7 @@ impl App {
         on
     }
 
-    /// Ready-to-send message: download links, plus the room code when in a room.
+    /// Ready-to-send message: download links, plus the invite link when in a room.
     pub(crate) fn share_message(&self) -> String {
         use crate::update::{DOWNLOAD_MACOS, DOWNLOAD_WINDOWS};
         let mut m = format!(
@@ -260,9 +266,9 @@ impl App {
              macOS 14+ (Apple Silicon): {DOWNLOAD_MACOS}"
         );
         if self.screen == Screen::Room {
-            if let Some(code) = &self.ticket {
+            if let Some(link) = &self.ticket {
                 m.push_str(&format!(
-                    "\n\nPotem kliknij „Dołącz” i wpisz kod pokoju „{}”: {code}",
+                    "\n\nPotem kliknij „Dołącz” i wklej link do pokoju „{}”: {link}",
                     self.room
                 ));
             }
@@ -283,7 +289,16 @@ impl App {
                     self.net_ready = true;
                     self.my_id = self.node.my_id();
                 }
-                Event::Ticket(t) => self.ticket = Some(t),
+                Event::Ticket { link, expires } => {
+                    self.ticket = Some(link);
+                    self.ticket_expires = Some(expires);
+                }
+                Event::JoinFailed(e) => {
+                    if self.screen == Screen::Room {
+                        self.reset_room(ctx);
+                    }
+                    self.join_error = Some(e);
+                }
                 Event::RoomName(r) => {
                     self.room = r;
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} – BibiCord", self.room)));
@@ -447,6 +462,12 @@ impl App {
             self.cue(crate::sounds::Cue::Disconnect);
         }
         self.node.leave();
+        self.ticket_input.clear();
+        self.reset_room(ctx);
+    }
+
+    /// Back to the start screen (the node has already left).
+    fn reset_room(&mut self, ctx: &egui::Context) {
         self.screen = Screen::Start;
         self.view = View::Chat;
         self.peers.clear();
@@ -454,6 +475,7 @@ impl App {
         self.chat.clear();
         self.unread = 0;
         self.ticket = None;
+        self.ticket_expires = None;
         self.room.clear();
         self.my_stream = None;
         self.stream_starting = false;
@@ -471,6 +493,11 @@ impl App {
             self.fullscreen = false;
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
         }
+    }
+
+    pub(crate) fn open_invite(&mut self) {
+        self.node.ensure_invite();
+        self.dialog = Some(Dialog::Invite);
     }
 
     pub(crate) fn join_voice(&mut self) {
@@ -657,6 +684,8 @@ impl App {
                 self.enter_room();
             } else if let Some(f) = &d.join {
                 if let Ok(t) = std::fs::read_to_string(f) {
+                    // Once: after `JoinFailed` we're back on this screen.
+                    d.join = None;
                     if self.node.join(&t, self.name.clone()).is_ok() {
                         self.enter_room();
                     }
@@ -721,7 +750,7 @@ impl App {
             match d.dialog.as_deref() {
                 Some("golive") => self.open_go_live(),
                 Some("settings") => self.open_settings(),
-                Some("invite") => self.dialog = Some(Dialog::Invite),
+                Some("invite") => self.open_invite(),
                 Some("update") => self.dialog = Some(Dialog::Update),
                 Some("share") => self.dialog = Some(Dialog::Share),
                 Some("profile") => self.open_profile(),
