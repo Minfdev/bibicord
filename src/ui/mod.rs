@@ -3,6 +3,7 @@
 
 mod chat;
 mod dialogs;
+mod history;
 mod profile;
 mod sidebar;
 mod stage;
@@ -10,7 +11,7 @@ mod start;
 pub mod theme;
 mod widgets;
 
-use crate::net::{Event, Events, MuteState, Node};
+use crate::net::{Event, EventRx, Events, MuteState, Node};
 use crate::proto::StreamInfo;
 use crate::video::encode::Settings;
 use eframe::egui::{self, Key, TextureHandle, ViewportCommand};
@@ -30,17 +31,7 @@ pub(crate) struct PeerView {
     pub avatar: Option<TextureHandle>,
 }
 
-pub(crate) enum ChatKind {
-    Message { from: Option<EndpointId>, name: String, text: String },
-    /// Kept in memory until the room is left; saved only on request.
-    File { from: Option<EndpointId>, name: String, file_name: String, data: Arc<Vec<u8>>, saved: bool },
-    System { icon: &'static str, who: String, text: String, good: bool },
-}
-
-pub(crate) struct ChatItem {
-    pub kind: ChatKind,
-    pub time: chrono::DateTime<chrono::Local>,
-}
+pub(crate) use history::{ChatItem, ChatKind};
 
 #[derive(PartialEq, Clone, Copy)]
 pub(crate) enum Screen {
@@ -67,7 +58,7 @@ pub(crate) enum Dialog {
 
 pub struct App {
     pub(crate) node: Node,
-    events: std::sync::mpsc::Receiver<Event>,
+    events: EventRx,
     pub(crate) screen: Screen,
     pub(crate) view: View,
     pub(crate) dialog: Option<Dialog>,
@@ -95,6 +86,9 @@ pub struct App {
     pub(crate) chat_input: String,
     pub(crate) unread: usize,
     pub(crate) stage_chat: bool,
+    /// Chat scroll position last frame (side panel or not, offset) and how
+    /// much the content above the view shrank since, to scroll back by.
+    pub(crate) chat_scroll: (Option<(bool, f32)>, f32),
 
     pub(crate) my_stream: Option<StreamInfo>,
     pub(crate) stream_starting: bool,
@@ -134,8 +128,7 @@ fn name_file() -> std::path::PathBuf {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         theme::install(&cc.egui_ctx);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let events = Events::new(tx, cc.egui_ctx.clone());
+        let (events, rx) = Events::new(cc.egui_ctx.clone());
         let demo = crate::demo::Demo::from_env();
         // Two instances on one account (demo runs) need different identities.
         let ephemeral = demo.is_some() || std::env::var_os("BIBICORD_EPHEMERAL_ID").is_some();
@@ -192,6 +185,7 @@ impl App {
             chat_input: String::new(),
             unread: 0,
             stage_chat: false,
+            chat_scroll: (None, 0.0),
             my_stream: None,
             stream_starting: false,
             camera_on: false,
@@ -232,10 +226,28 @@ impl App {
 
     fn system(&mut self, icon: &'static str, who: String, text: impl Into<String>, good: bool) {
         let text = text.into();
-        self.chat.push(ChatItem {
-            kind: ChatKind::System { icon, who, text, good },
-            time: chrono::Local::now(),
-        });
+        self.push_chat(ChatKind::System { icon, who, text, good });
+    }
+
+    /// Adds to the history and keeps it within its limits.
+    fn push_chat(&mut self, kind: ChatKind) {
+        self.chat.push(ChatItem::new(kind));
+        if let Some(height) = history::trim(&mut self.chat, history::MAX_ITEMS, history::MAX_BYTES) {
+            // Someone reading older messages keeps them in place.
+            self.chat_scroll.1 += height;
+            let chat = &self.chat;
+            self.gone_avatars.retain(|id, _| chat.iter().any(|i| i.from() == Some(*id)));
+        }
+    }
+
+    /// Tells who didn't get `what` (a message, a file): their queue is full.
+    pub(crate) fn undelivered(&mut self, what: &str, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        let why = if names.len() == 1 { "Odbiorca nie nadąża" } else { "Odbiorcy nie nadążają" };
+        let text = format!("Nie dostarczono {what} do: {}. {why} z odbiorem.", names.join(", "));
+        self.error = Some((text, Instant::now()));
     }
 
     /// Plays a UI sound on the selected output device.
@@ -283,7 +295,7 @@ impl App {
     fn handle_events(&mut self, ctx: &egui::Context) {
         use crate::sounds::Cue;
         use widgets::ic;
-        while let Ok(ev) = self.events.try_recv() {
+        while let Some(ev) = self.events.try_recv() {
             match ev {
                 Event::Ready => {
                     self.net_ready = true;
@@ -387,7 +399,8 @@ impl App {
                     self.incoming(ctx, from, ChatKind::Message { from, name, text });
                 }
                 Event::File { from, name, file_name, data } => {
-                    self.incoming(ctx, from, ChatKind::File { from, name, file_name, data, saved: false });
+                    let size = data.len();
+                    self.incoming(ctx, from, ChatKind::File { from, name, file_name, size, data: Some(data), saved: false });
                 }
                 Event::MyStream(info) => {
                     self.stream_starting = false;
@@ -446,7 +459,7 @@ impl App {
         if from.is_some() && (!self.chat_visible() || !ctx.input(|i| i.focused)) {
             self.cue(crate::sounds::Cue::Message);
         }
-        self.chat.push(ChatItem { kind, time: chrono::Local::now() });
+        self.push_chat(kind);
     }
 
     pub(crate) fn enter_room(&mut self) {
@@ -711,13 +724,20 @@ impl App {
             if d.view_voice {
                 self.view = View::Voice;
             }
+            for (kind, time) in crate::demo::history(d.history, &self.name) {
+                self.push_chat(kind);
+                if let Some(last) = self.chat.last_mut() {
+                    last.time = time;
+                }
+            }
             self.stage_chat = d.stage_chat;
         }
         if !d.chat_sent && !self.peers.is_empty() {
             d.chat_sent = true;
             for line in std::mem::take(&mut d.chat) {
-                if let Err(e) = self.node.send_chat(line) {
-                    self.error = Some((e.to_string(), Instant::now()));
+                match self.node.send_chat(line) {
+                    Ok(skipped) => self.undelivered("wiadomości", skipped),
+                    Err(e) => self.error = Some((e.to_string(), Instant::now())),
                 }
             }
             for path in std::mem::take(&mut d.files) {
@@ -731,6 +751,15 @@ impl App {
             {
                 *saved = true;
             }
+        }
+        if let Some((every, last, n)) = &mut d.tick
+            && self.screen == Screen::Room
+            && last.elapsed() >= *every
+        {
+            *last = Instant::now();
+            *n += 1;
+            let from = Some(iroh::SecretKey::from_bytes(&[1; 32]).public());
+            self.push_chat(ChatKind::Message { from, name: "Ola".into(), text: format!("nowa wiadomość {n}") });
         }
         if d.stream && !d.stream_started && !self.peers.is_empty() && crate::ffmpeg::path().is_some() {
             d.stream_started = true;
