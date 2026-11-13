@@ -31,7 +31,9 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
   pola tekstowe, awatary z pierścieniem mówienia, odznaki NA ŻYWO, wiersze
   listy, menu, modale.
 * **Ekrany** – start, czat (wiadomości grupowane, pliki do 1 MB: spinacz lub
-  przeciągnięcie na okno, zapis przyciskiem „Zapisz”), scena głosowa z kafelkami
+  przeciągnięcie na okno, zapis przyciskiem „Zapisz”; historia mieści do 2000
+  pozycji i 64 MB, a po jej zapełnieniu najstarsze pliki stają się „już
+  niedostępne”, zanim zaczną znikać najstarsze wiadomości), scena głosowa z kafelkami
   16:9, oglądanie streamu z paskiem uczestników i czatem obok, okna
   „Udostępnij ekran”, „Zaproś” i „Ustawienia głosu”.
 
@@ -199,6 +201,7 @@ Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 |---|---|
 | `src/net.rs` | pokój P2P (siatka połączeń iroh), czat, sygnalizacja, przesyłanie wideo i głosu |
 | `src/proto.rs` | protokół, linki zaproszeń i dowody uwierzytelnienia |
+| `src/flow.rs` | limity kolejek i tempa: nikt w pokoju nie zapcha pamięci pozostałych |
 | `src/identity.rs` | stała tożsamość urządzenia (`identity.key`) |
 | `src/video/encode.rs` | przechwytywanie ekranu i wybór enkodera sprzętowego |
 | `src/video/hub.rs` | rozsyłanie strumienia do widzów (klatki kluczowe, wolni widzowie) |
@@ -208,6 +211,7 @@ Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 | `src/ui/theme.rs` | tokeny design systemu i instalacja fontów |
 | `src/ui/widgets.rs` | komponenty |
 | `src/ui/{start,sidebar,chat,stage,dialogs}.rs` | ekrany i okna |
+| `src/ui/history.rs` | historia czatu i jej limity |
 | `src/demo.rs` | skryptowane uruchomienia (testy, zrzuty ekranu) |
 
 ## Licencje

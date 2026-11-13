@@ -3,6 +3,7 @@
 //! are only used for the initial rendezvous or when a direct path is
 //! impossible. There is no server of our own.
 
+use crate::flow::{Bucket, CtrlQueue, Push};
 use crate::proto::{self, ALPN, Auth, DGRAM_VOICE, Msg, StreamInfo, TAG_CAMERA, TAG_CONTROL, TAG_WATCH};
 use crate::video::{self, decode::FrameSlot};
 use crate::voice::Voice;
@@ -45,32 +46,106 @@ pub enum Event {
     Error(String),
 }
 
-/// Delivers events to the UI and wakes it up.
+impl Event {
+    /// What the event holds in memory until the UI takes it, roughly.
+    fn cost(&self) -> usize {
+        let info = |i: &Option<StreamInfo>| i.as_ref().map_or(0, |i| i.encoder.len());
+        let avatar = |a: &Option<Vec<u8>>| a.as_ref().map_or(0, |a| a.len());
+        // Every variant listed: a new one with data must be counted here.
+        crate::flow::EVENT_OVERHEAD
+            + match self {
+                Event::Chat { name, text, .. } => name.len() + text.len(),
+                Event::File { name, file_name, data, .. } => name.len() + file_name.len() + data.len(),
+                Event::PeerJoined { name, avatar: a, .. } | Event::PeerProfile { name, avatar: a, .. } => {
+                    name.len() + avatar(a)
+                }
+                Event::PeerStream { info: i, .. } | Event::MyStream(i) => info(i),
+                Event::Ticket { link: s, .. }
+                | Event::JoinFailed(s)
+                | Event::RoomName(s)
+                | Event::Status(s)
+                | Event::Error(s) => s.len(),
+                Event::Ready
+                | Event::PeerLeft { .. }
+                | Event::PeerCamera { .. }
+                | Event::PeerVoice { .. }
+                | Event::PeerMute { .. }
+                | Event::MyCamera(_)
+                | Event::MyVoice(_)
+                | Event::Watching(_) => 0,
+            }
+    }
+}
+
+/// Delivers events to the UI and wakes it up. Counts what the UI hasn't
+/// taken yet, so peer readers can wait while it is behind (e.g. a hidden
+/// window that draws no frames).
 #[derive(Clone)]
 pub struct Events {
-    tx: std::sync::mpsc::Sender<Event>,
+    tx: std::sync::mpsc::Sender<(Event, usize)>,
     ctx: eframe::egui::Context,
+    pending: Arc<crate::flow::Pending>,
+}
+
+/// The UI end of `Events`.
+pub struct EventRx {
+    rx: std::sync::mpsc::Receiver<(Event, usize)>,
+    pending: Arc<crate::flow::Pending>,
+}
+
+impl EventRx {
+    pub fn try_recv(&self) -> Option<Event> {
+        let (e, cost) = self.rx.try_recv().ok()?;
+        self.pending.remove(cost);
+        Some(e)
+    }
+
+    #[cfg(test)]
+    pub fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
+        std::iter::from_fn(|| self.try_recv())
+    }
 }
 
 impl Events {
-    pub fn new(tx: std::sync::mpsc::Sender<Event>, ctx: eframe::egui::Context) -> Self {
-        Events { tx, ctx }
+    pub fn new(ctx: eframe::egui::Context) -> (Self, EventRx) {
+        Self::with_budget(ctx, crate::flow::EVENT_BUDGET)
+    }
+
+    pub fn with_budget(ctx: eframe::egui::Context, budget: usize) -> (Self, EventRx) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = Arc::new(crate::flow::Pending::new(budget));
+        (Events { tx, ctx, pending: pending.clone() }, EventRx { rx, pending })
     }
 
     pub fn send(&self, e: Event) {
-        let _ = self.tx.send(e);
+        let cost = e.cost();
+        // Counted before it can be taken, so the count never goes below zero.
+        self.pending.add(cost);
+        if self.tx.send((e, cost)).is_err() {
+            self.pending.remove(cost);
+        }
         self.ctx.request_repaint();
     }
 
     pub fn repaint(&self) {
         self.ctx.request_repaint();
     }
+
+    /// Returns once the UI has caught up to within the budget.
+    async fn room(&self) {
+        self.pending.room().await;
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.pending.get()
+    }
 }
 
 struct PeerConn {
     name: String,
     conn: Connection,
-    ctrl: mpsc::UnboundedSender<Msg>,
+    ctrl: Arc<CtrlQueue>,
     dialer: EndpointId,
     voice: bool,
     stream: Option<StreamInfo>,
@@ -136,6 +211,7 @@ struct Invite {
 
 const INVITE_TTL: Duration = Duration::from_secs(24 * 3600);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Incoming connections that haven't authenticated yet.
 const MAX_PENDING: usize = 32;
 
@@ -215,6 +291,10 @@ struct Inner {
     pub frames: Arc<FrameSlot>,
     key: iroh::SecretKey,
     pending: AtomicUsize,
+    /// Authenticated connections waiting for the UI to catch up.
+    at_gate: AtomicUsize,
+    /// Per-peer budget of queued chat and files (`flow::BULK_BUDGET`).
+    bulk_budget: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +334,10 @@ impl std::fmt::Debug for Inner {
 
 impl Node {
     pub fn new(rt: tokio::runtime::Handle, events: Events, key: iroh::SecretKey) -> Self {
+        Self::with_bulk_budget(rt, events, key, crate::flow::BULK_BUDGET)
+    }
+
+    fn with_bulk_budget(rt: tokio::runtime::Handle, events: Events, key: iroh::SecretKey, bulk_budget: usize) -> Self {
         let node = Node(Arc::new(Inner {
             rt,
             endpoint: OnceCell::new(),
@@ -262,6 +346,8 @@ impl Node {
             frames: Arc::new(FrameSlot::default()),
             key,
             pending: AtomicUsize::new(0),
+            at_gate: AtomicUsize::new(0),
+            bulk_budget,
         }));
         let n = node.clone();
         node.0.rt.spawn(async move {
@@ -476,34 +562,36 @@ impl Node {
     }
 
     /// Posts a chat message to everyone in the room; at most `MAX_CHAT_BYTES`.
-    pub fn send_chat(&self, text: String) -> Result<()> {
+    /// Returns the names of people it couldn't be queued for (see `queue_all`).
+    pub fn send_chat(&self, text: String) -> Result<Vec<String>> {
         if text.len() > proto::MAX_CHAT_BYTES {
             bail!("Wiadomość jest za długa (maks. 1 MB)");
         }
+        let msg = Msg::Chat { text };
         let s = self.0.state.lock().unwrap();
-        for p in s.peers.values() {
-            let _ = p.ctrl.send(Msg::Chat { text: text.clone() });
-        }
+        let skipped = Self::queue_all(&s, &msg, true);
         let name = s.name.clone();
         drop(s);
+        let Msg::Chat { text } = msg else { unreachable!() };
         self.emit(Event::Chat { from: None, name, text });
-        Ok(())
+        Ok(skipped)
     }
 
     /// Posts a file to everyone in the room; at most `MAX_FILE_BYTES`.
-    pub fn send_file(&self, file_name: &str, data: Vec<u8>) -> Result<()> {
+    /// Returns the names of people it couldn't be queued for.
+    pub fn send_file(&self, file_name: &str, data: Vec<u8>) -> Result<Vec<String>> {
         if data.len() > proto::MAX_FILE_BYTES {
             bail!("Plik jest za duży (maks. 1 MB)");
         }
         let file_name = proto::clean_file_name(file_name);
+        let msg = Msg::File { name: file_name.clone(), data };
         let s = self.0.state.lock().unwrap();
-        for p in s.peers.values() {
-            let _ = p.ctrl.send(Msg::File { name: file_name.clone(), data: data.clone() });
-        }
+        let skipped = Self::queue_all(&s, &msg, true);
         let name = s.name.clone();
         drop(s);
+        let Msg::File { data, .. } = msg else { unreachable!() };
         self.emit(Event::File { from: None, name, file_name, data: Arc::new(data) });
-        Ok(())
+        Ok(skipped)
     }
 
     /// Sets the picture sent to peers we meet from now on (no broadcast).
@@ -541,10 +629,35 @@ impl Node {
     }
 
     fn broadcast_msg(&self, msg: Msg) {
-        let s = self.0.state.lock().unwrap();
-        for p in s.peers.values() {
-            let _ = p.ctrl.send(msg.clone());
+        Self::queue_all(&self.0.state.lock().unwrap(), &msg, false);
+    }
+
+    /// Encodes `msg` once and queues it for every peer. `bulk` (chat, files)
+    /// is skipped for peers whose queue is over budget: they aren't keeping
+    /// up, and holding more for them would grow without bound. Returns their
+    /// names. State messages always go in; a peer whose queue overflows
+    /// anyway reads nothing and is disconnected.
+    fn queue_all(s: &State, msg: &Msg, bulk: bool) -> Vec<String> {
+        let frame = match proto::encode_msg(msg) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("encode: {e:#}");
+                return Vec::new();
+            }
+        };
+        let mut skipped = Vec::new();
+        for (id, p) in &s.peers {
+            match p.ctrl.push(frame.clone(), bulk) {
+                Push::Queued => {}
+                Push::Skipped => skipped.push(p.name.clone()),
+                Push::Overflow => {
+                    tracing::warn!("{id} reads nothing, closing");
+                    p.conn.close(5u32.into(), b"backlog");
+                }
+            }
         }
+        skipped.sort();
+        skipped
     }
 
     fn dial(&self, addr: EndpointAddr, cred: Cred, room_gen: u64) -> BoxFuture<Result<()>> {
@@ -727,19 +840,34 @@ impl Node {
         // The caller speaks first. The callee answers with a `Hello` built
         // under the lock that adds the caller to `peers`, so of two
         // simultaneous joiners the later one always hears of the earlier.
+        // Every connection adds events (a picture among them), so none is
+        // taken in while the UI is behind: a peer reconnecting in a loop
+        // can't grow them. While a hidden window holds a full budget,
+        // joiners give up after the `Hello` timeout and stay alone in an
+        // empty room; that is accepted.
+        self.0.at_gate.fetch_add(1, Ordering::SeqCst);
+        let gate = Pending(&self.0.at_gate);
+        let ready = crate::flow::unless_closed(self.0.events.room(), conn.closed());
+        let ready = tokio::time::timeout(HELLO_TIMEOUT, ready).await;
+        drop(gate);
+        if !matches!(ready, Ok(true)) {
+            conn.close(4u32.into(), b"busy");
+            bail!("UI behind");
+        }
         if dialed {
             let hello = self.hello(room_gen).context("room changed")?;
             proto::write_msg(&mut send, &hello).await?;
         }
         let Msg::Hello { name, room, peers, stream, camera, voice, muted, deafened, avatar } =
-            tokio::time::timeout(Duration::from_secs(15), proto::read_msg(&mut recv)).await??
+            tokio::time::timeout(HELLO_TIMEOUT, proto::read_msg(&mut recv)).await??
         else {
             bail!("expected hello");
         };
         let name = peer_display_name(&name, &remote);
         let avatar = avatar.filter(|a| a.len() <= crate::avatar::MAX_BYTES);
+        let (stream, camera) = (proto::clean_stream_info(stream), proto::clean_stream_info(camera));
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        let ctrl = Arc::new(CtrlQueue::new(self.0.bulk_budget));
         let stable = conn.stable_id();
         let mut adopted_room = None;
         let reply = {
@@ -773,7 +901,7 @@ impl Node {
                 PeerConn {
                     name: name.clone(),
                     conn: conn.clone(),
-                    ctrl: tx,
+                    ctrl: ctrl.clone(),
                     dialer,
                     voice,
                     stream: stream.clone(),
@@ -810,14 +938,19 @@ impl Node {
             }
         }
 
-        // Writer.
-        self.spawn(async move {
-            while let Some(m) = rx.recv().await {
-                if proto::write_msg(&mut send, &m).await.is_err() {
-                    break;
+        // Writer. Bulk budget is given back only once a frame is written.
+        {
+            let ctrl = ctrl.clone();
+            self.spawn(async move {
+                while let Some((frame, cost)) = ctrl.next().await {
+                    let ok = send.write_chunk(frame).await.is_ok();
+                    ctrl.sent(cost);
+                    if !ok {
+                        break;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Extra streams: video watch requests.
         {
@@ -853,8 +986,33 @@ impl Node {
             });
         }
 
-        // Reader.
-        while let Ok(msg) = proto::read_msg(&mut recv).await {
+        // Reader. Before each message it waits for the rate limits and for
+        // the UI to catch up with events (`Events::room`), instead of dropping
+        // anything: QUIC flow control then stalls the sender, whose queue
+        // refuses further chat and reports it. Waiting also holds back this
+        // peer's state messages (voice, mute, …) behind its chat; they stay
+        // in order and arrive late, which is the accepted cost.
+        let mut msgs = Bucket::new(crate::flow::MSG_BURST, crate::flow::MSG_RATE, Instant::now());
+        let mut bytes = Bucket::new(crate::flow::BYTE_BURST, crate::flow::BYTE_RATE, Instant::now());
+        loop {
+            let ready = async {
+                loop {
+                    let now = Instant::now();
+                    let wait = msgs.wait(now, 1.0).max(bytes.wait(now, 0.0));
+                    if wait.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(wait).await;
+                }
+                self.0.events.room().await;
+            };
+            if !crate::flow::unless_closed(ready, conn.closed()).await {
+                break;
+            }
+            let Ok((msg, len)) = proto::read_frame(&mut recv).await else { break };
+            let now = Instant::now();
+            msgs.take(now, 1.0);
+            bytes.take(now, len as f64);
             match msg {
                 Msg::Chat { text } => {
                     if text.len() > proto::MAX_CHAT_BYTES {
@@ -874,6 +1032,7 @@ impl Node {
                     self.emit(Event::File { from: Some(remote), name, file_name, data: Arc::new(data) });
                 }
                 Msg::Stream(info) => {
+                    let info = proto::clean_stream_info(info);
                     let stop_watch = {
                         let mut s = self.0.state.lock().unwrap();
                         if let Some(p) = s.peers.get_mut(&remote) {
@@ -886,7 +1045,7 @@ impl Node {
                     }
                     self.emit(Event::PeerStream { id: remote, info });
                 }
-                Msg::Camera(info) => self.set_peer_camera(remote, info),
+                Msg::Camera(info) => self.set_peer_camera(remote, proto::clean_stream_info(info)),
                 Msg::Voice(on) => {
                     {
                         let mut s = self.0.state.lock().unwrap();
@@ -917,6 +1076,7 @@ impl Node {
         }
 
         // Cleanup (only if this connection is still the active one).
+        ctrl.close();
         let removed = {
             let mut s = self.0.state.lock().unwrap();
             if s.peers.get(&remote).is_some_and(|p| p.conn.stable_id() == stable) {
@@ -1242,7 +1402,7 @@ impl Node {
         let (id, devices, deafened, prefs) = (s.voice_gen, s.devices.clone(), s.mute.deafened, s.voice_prefs);
         let n = self.clone();
         self.spawn(async move {
-            let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+            let (tx, mut rx) = crate::voice::packet_channel();
             // Start muted: `set_mute` can't reach a Voice that isn't stored
             // yet, and frames queued in `tx` meanwhile would go out later.
             // The real setting is applied below, under the same lock.
@@ -1359,20 +1519,25 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    fn node() -> (Node, std::sync::mpsc::Receiver<Event>) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ev = Events::new(tx, eframe::egui::Context::default());
+    fn node() -> (Node, EventRx) {
+        let (ev, rx) = Events::new(eframe::egui::Context::default());
         (Node::new(tokio::runtime::Handle::current(), ev, iroh::SecretKey::generate()), rx)
     }
 
+    /// Queues `msg` to `to` as is, skipping the sender's checks.
+    fn push_raw(n: &Node, to: EndpointId, msg: Msg) {
+        let ctrl = n.0.state.lock().unwrap().peers.get(&to).unwrap().ctrl.clone();
+        assert_eq!(ctrl.push(proto::encode_msg(&msg).unwrap(), false), Push::Queued);
+    }
+
     async fn wait_for(
-        rx: &std::sync::mpsc::Receiver<Event>,
+        rx: &EventRx,
         secs: u64,
         mut f: impl FnMut(&Event) -> bool,
     ) -> Event {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
-            while let Ok(e) = rx.try_recv() {
+            while let Some(e) = rx.try_recv() {
                 if f(&e) {
                     return e;
                 }
@@ -1397,7 +1562,7 @@ mod tests {
 
     /// `MyVoice` events that arrive within `ms`; long enough for a fake
     /// voice start to finish.
-    async fn my_voice_events(rx: &std::sync::mpsc::Receiver<Event>, ms: u64) -> Vec<bool> {
+    async fn my_voice_events(rx: &EventRx, ms: u64) -> Vec<bool> {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         rx.try_iter().filter_map(|e| if let Event::MyVoice(on) = e { Some(on) } else { None }).collect()
     }
@@ -1597,9 +1762,9 @@ mod tests {
 
         // Over the limit but within a frame: the receiver's check drops it.
         // Far over: `read_msg` skips the frame.
-        let ctrl = b.0.state.lock().unwrap().peers.get(&a.my_id().unwrap()).unwrap().ctrl.clone();
-        ctrl.send(Msg::Chat { text: "y".repeat(proto::MAX_CHAT_BYTES + 1000) }).unwrap();
-        ctrl.send(Msg::Chat { text: "z".repeat(2 << 20) }).unwrap();
+        let ida = a.my_id().unwrap();
+        push_raw(&b, ida, Msg::Chat { text: "y".repeat(proto::MAX_CHAT_BYTES + 1000) });
+        push_raw(&b, ida, Msg::Chat { text: "z".repeat(2 << 20) });
         b.send_chat("po długiej".into()).unwrap();
         let e = wait_for(&arx, 20, |e| matches!(e, Event::Chat { from: Some(_), .. } | Event::PeerLeft { .. })).await;
         assert!(matches!(&e, Event::Chat { text, .. } if text == "po długiej"), "{e:?}");
@@ -1671,9 +1836,9 @@ mod tests {
     /// Our own link is recognised before the endpoint is up.
     #[tokio::test]
     async fn join_own_link() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (ev, _rx) = Events::new(eframe::egui::Context::default());
         let key = iroh::SecretKey::generate();
-        let a = Node::new(tokio::runtime::Handle::current(), Events::new(tx, eframe::egui::Context::default()), key.clone());
+        let a = Node::new(tokio::runtime::Handle::current(), ev, key.clone());
         let link = proto::format_invite(&proto::InviteLink { id: key.public(), token: [1; 16], expires: u32::MAX });
         assert_eq!(a.join(&link, "Ala".into()).unwrap_err().to_string(), "To Twoje własne zaproszenie");
         assert!(!a.0.state.lock().unwrap().in_room);
@@ -1685,7 +1850,7 @@ mod tests {
 
     // ------------------------------------------------ invites over the network
 
-    async fn ticket(rx: &std::sync::mpsc::Receiver<Event>) -> String {
+    async fn ticket(rx: &EventRx) -> String {
         let Event::Ticket { link, .. } = wait_for(rx, 20, |e| matches!(e, Event::Ticket { .. })).await else {
             unreachable!()
         };
@@ -1693,13 +1858,13 @@ mod tests {
     }
 
     /// Joins and waits until `b` has met the inviter.
-    async fn join_ok(b: &Node, rx: &std::sync::mpsc::Receiver<Event>, link: &str) {
+    async fn join_ok(b: &Node, rx: &EventRx, link: &str) {
         b.join(link, "Bob".into()).unwrap();
         let e = wait_for(rx, 40, |e| matches!(e, Event::PeerJoined { .. } | Event::JoinFailed(_))).await;
         assert!(matches!(e, Event::PeerJoined { .. }), "{e:?}");
     }
 
-    async fn join_fails(b: &Node, rx: &std::sync::mpsc::Receiver<Event>, link: &str) -> String {
+    async fn join_fails(b: &Node, rx: &EventRx, link: &str) -> String {
         b.join(link, "Bob".into()).unwrap();
         let e = wait_for(rx, 40, |e| matches!(e, Event::PeerJoined { .. } | Event::JoinFailed(_))).await;
         let Event::JoinFailed(msg) = e else { panic!("joined: {e:?}") };
@@ -1779,7 +1944,7 @@ mod tests {
     }
 
     /// `id` never made it into `a`'s room.
-    async fn assert_outside(a: &Node, rx: &std::sync::mpsc::Receiver<Event>, id: EndpointId) {
+    async fn assert_outside(a: &Node, rx: &EventRx, id: EndpointId) {
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!a.0.state.lock().unwrap().peers.contains_key(&id), "in peers");
         assert!(!rx.try_iter().any(|e| matches!(e, Event::PeerJoined { id: j, .. } if j == id)), "PeerJoined");
@@ -1966,7 +2131,7 @@ mod tests {
     }
 
     /// Waits until `rx` has seen `PeerJoined` for every name in `names`.
-    async fn wait_joined(rx: &std::sync::mpsc::Receiver<Event>, names: &[&str]) {
+    async fn wait_joined(rx: &EventRx, names: &[&str]) {
         let mut seen = HashSet::new();
         while !names.iter().all(|n| seen.contains(*n)) {
             let Event::PeerJoined { name, .. } = wait_for(rx, 40, |e| matches!(e, Event::PeerJoined { .. })).await else {
@@ -2111,9 +2276,9 @@ mod tests {
         assert!(b.send_file("big.bin", vec![0; proto::MAX_FILE_BYTES + 1]).is_err());
 
         // Too large from a peer that skips the check: dropped, connection kept.
-        let ctrl = b.0.state.lock().unwrap().peers.get(&a.my_id().unwrap()).unwrap().ctrl.clone();
-        ctrl.send(Msg::File { name: "big.bin".into(), data: vec![0; proto::MAX_FILE_BYTES + 1] }).unwrap();
-        ctrl.send(Msg::File { name: "huge.bin".into(), data: vec![0; 2 << 20] }).unwrap();
+        let ida = a.my_id().unwrap();
+        push_raw(&b, ida, Msg::File { name: "big.bin".into(), data: vec![0; proto::MAX_FILE_BYTES + 1] });
+        push_raw(&b, ida, Msg::File { name: "huge.bin".into(), data: vec![0; 2 << 20] });
         b.send_chat("po pliku".into()).unwrap();
         let e = wait_for(&arx, 20, |e| matches!(e, Event::File { .. } | Event::Chat { .. } | Event::PeerLeft { .. })).await;
         assert!(matches!(&e, Event::Chat { text, .. } if text == "po pliku"), "{e:?}");
@@ -2121,6 +2286,232 @@ mod tests {
         for n in [a, b, c] {
             n.leave();
         }
+    }
+
+    /// What waits for the UI is counted from `send` until it is taken.
+    #[test]
+    fn event_cost_counted_until_taken() {
+        use crate::flow::EVENT_OVERHEAD;
+        let (ev, rx) = Events::with_budget(eframe::egui::Context::default(), 1000);
+        ev.send(Event::Chat { from: None, name: "Ala".into(), text: "x".repeat(500) });
+        assert_eq!(ev.pending(), EVENT_OVERHEAD + 503);
+        ev.send(Event::Status(String::new()));
+        assert_eq!(ev.pending(), 2 * EVENT_OVERHEAD + 503);
+        assert!(matches!(rx.try_recv(), Some(Event::Chat { .. })));
+        assert_eq!(ev.pending(), EVENT_OVERHEAD);
+        assert!(rx.try_recv().is_some());
+        assert!(rx.try_recv().is_none());
+        assert_eq!(ev.pending(), 0);
+        drop(rx);
+        ev.send(Event::Status(String::new()));
+        assert_eq!(ev.pending(), 0, "nobody to take it");
+    }
+
+    /// Every event pays for the text and bytes it holds, whoever sent them.
+    #[test]
+    fn event_cost_covers_all_data() {
+        use crate::flow::EVENT_OVERHEAD;
+        let big = || "x".repeat(1 << 20);
+        let info = StreamInfo { codec: proto::Codec::H264, width: 1, height: 1, fps: 1, bitrate_kbps: 1, encoder: big() };
+        let id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        for e in [
+            Event::PeerStream { id, info: Some(info.clone()) },
+            Event::MyStream(Some(info)),
+            Event::RoomName(big()),
+            Event::Status(big()),
+            Event::Error(big()),
+            Event::JoinFailed(big()),
+            Event::Ticket { link: big(), expires: chrono::Local::now() },
+            Event::PeerJoined { id, name: big(), avatar: None },
+            Event::PeerProfile { id, name: String::new(), avatar: Some(vec![0; 1 << 20]) },
+        ] {
+            let what: String = format!("{e:?}").chars().take(40).collect();
+            assert_eq!(e.cost(), EVENT_OVERHEAD + (1 << 20), "{what}");
+        }
+    }
+
+    /// While the UI is over its budget a new connection adds no events and
+    /// no peer; once the UI catches up, the waiting join completes.
+    /// Run with: cargo test e2e_join_while_ui_behind -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_join_while_ui_behind() {
+        /// The next event matching `f`; on timeout says which `stage` it was.
+        async fn stage(rx: &EventRx, secs: u64, stage: &str, mut f: impl FnMut(&Event) -> bool) -> Event {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                if let Some(e) = rx.try_iter().find(|e| f(e)) {
+                    return e;
+                }
+                assert!(Instant::now() < deadline, "timeout: {stage}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        let (aev, arx) = Events::with_budget(eframe::egui::Context::default(), 1 << 20);
+        let a = Node::new(tokio::runtime::Handle::current(), aev, iroh::SecretKey::generate());
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        let t = ticket(&arx).await;
+        a.0.events.send(Event::Chat { from: None, name: "Ala".into(), text: "x".repeat(2 << 20) });
+        let before = a.0.events.pending();
+        b.join(&t, "Bob".into()).unwrap();
+
+        // Bob gets through authentication and waits at the gate.
+        let start = Instant::now();
+        while a.0.at_gate.load(Ordering::SeqCst) == 0 {
+            if let Some(Event::JoinFailed(msg)) = brx.try_iter().find(|e| matches!(e, Event::JoinFailed(_))) {
+                panic!("join failed before reaching the gate: {msg}");
+            }
+            assert!(start.elapsed() < Duration::from_secs(40), "timeout: connection reaching the gate");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(a.0.at_gate.load(Ordering::SeqCst), 1, "left the gate while the UI was behind");
+        assert_eq!(a.0.events.pending(), before);
+        assert!(a.0.state.lock().unwrap().peers.is_empty(), "joined while the UI was behind");
+
+        // The UI catches up within the `Hello` timeout.
+        assert!(matches!(arx.try_recv(), Some(Event::Chat { .. })));
+        stage(&arx, 20, "Ala meeting Bob after the UI caught up", |e| matches!(e, Event::PeerJoined { .. })).await;
+        let e = stage(&brx, 20, "Bob meeting Ala after the UI caught up", |e| {
+            matches!(e, Event::PeerJoined { .. } | Event::JoinFailed(_))
+        })
+        .await;
+        assert!(matches!(e, Event::PeerJoined { .. }), "{e:?}");
+        assert_eq!(a.0.at_gate.load(Ordering::SeqCst), 0);
+        a.leave();
+        b.leave();
+    }
+
+    const SLOW_BUDGET: usize = 4 << 20;
+
+    /// `a` (event budget `SLOW_BUDGET`) and `b` (bulk budget the same) in a
+    /// room; `a`'s UI then takes nothing while `b` sends files until its
+    /// queue to `a` has refused 20. Returns how many were queued.
+    async fn stalled_pair() -> (Node, EventRx, Node, usize) {
+        let bound = SLOW_BUDGET + proto::MAX_FILE_BYTES + 4096;
+        let rt = tokio::runtime::Handle::current();
+        let (aev, arx) = Events::with_budget(eframe::egui::Context::default(), SLOW_BUDGET);
+        let a = Node::new(rt.clone(), aev, iroh::SecretKey::generate());
+        let (bev, _brx) = Events::new(eframe::egui::Context::default());
+        let b = Node::with_bulk_budget(rt, bev, iroh::SecretKey::generate(), SLOW_BUDGET);
+        a.create_room("Ala".into(), "Test".into());
+        let t = ticket(&arx).await;
+        b.join(&t, "Bob".into()).unwrap();
+        wait_for(&arx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+        let ida = a.my_id().unwrap();
+        while !b.0.state.lock().unwrap().peers.contains_key(&ida) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        while arx.try_recv().is_some() {}
+
+        // From now on `a`'s UI takes nothing.
+        let file = vec![7u8; proto::MAX_FILE_BYTES];
+        let (mut queued, mut refused, mut sent_bytes) = (0, 0, 0);
+        let start = Instant::now();
+        while refused < 20 {
+            assert!(start.elapsed() < Duration::from_secs(90), "never refused: {queued} queued");
+            match b.send_file("x.bin", file.clone()).unwrap().as_slice() {
+                [] => queued += 1,
+                [who] if who == "Ala" => refused += 1,
+                other => panic!("{other:?}"),
+            }
+            sent_bytes += file.len();
+            assert!(a.0.events.pending() <= bound, "pending {} B", a.0.events.pending());
+            // Held by the sender, the receiver and QUIC buffers in between.
+            assert!(queued <= 2 * SLOW_BUDGET / proto::MAX_FILE_BYTES + 8, "sender queued {queued} files");
+            tokio::time::sleep(Duration::from_millis(if refused > 0 { 50 } else { 10 })).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let pending = a.0.events.pending();
+        println!("{queued} queued, {refused} refused, {} MB tried, {pending} B pending", sent_bytes >> 20);
+        assert!(pending <= bound, "pending {pending} B");
+        assert!(pending > SLOW_BUDGET / 2, "the receiver wasn't the one holding back: {pending} B");
+        assert!(sent_bytes > 4 * SLOW_BUDGET);
+        (a, arx, b, queued)
+    }
+
+    /// A receiver whose UI takes no events (hidden window): it holds no
+    /// more than its event budget plus one message in flight, the sender's
+    /// queue refuses the rest and says so, nothing that was queued is lost,
+    /// and the connection works again once the UI catches up.
+    /// Run with: cargo test e2e_slow_receiver -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_slow_receiver() {
+        let (a, arx, b, queued) = stalled_pair().await;
+        let mut files = 0;
+        let start = Instant::now();
+        while files < queued {
+            assert!(start.elapsed() < Duration::from_secs(60), "{files} of {queued} files");
+            for e in arx.try_iter() {
+                match e {
+                    Event::File { data, .. } => {
+                        assert_eq!(data.len(), proto::MAX_FILE_BYTES);
+                        files += 1;
+                    }
+                    Event::PeerLeft { .. } => panic!("disconnected"),
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(b.send_chat("już jest".into()).unwrap(), Vec::<String>::new());
+        let e = wait_for(&arx, 20, |e| matches!(e, Event::Chat { .. } | Event::File { .. } | Event::PeerLeft { .. })).await;
+        assert!(matches!(&e, Event::Chat { text, .. } if text == "już jest"), "{e:?}");
+        assert!(a.0.state.lock().unwrap().peers.contains_key(&b.my_id().unwrap()));
+        a.leave();
+        b.leave();
+    }
+
+    /// Leaving while a reader waits for the UI ends it: no task is left
+    /// holding the node.
+    /// Run with: cargo test e2e_slow_receiver_leave -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_slow_receiver_leave() {
+        let (a, _arx, b, _) = stalled_pair().await;
+        a.leave();
+        let start = Instant::now();
+        while Arc::strong_count(&a.0) > 1 {
+            assert!(start.elapsed() < Duration::from_secs(10), "{} references left", Arc::strong_count(&a.0));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        b.leave();
+    }
+
+    /// Past the burst, control messages from a peer are read at the
+    /// steady rate; none are lost on the way.
+    /// Run with: cargo test e2e_rate_limit -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_rate_limit() {
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        b.join(&ticket(&arx).await, "Bob".into()).unwrap();
+        wait_for(&arx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+        wait_for(&brx, 30, |e| matches!(e, Event::PeerJoined { .. })).await;
+        let n = crate::flow::MSG_BURST as usize + 60;
+        let start = Instant::now();
+        for i in 0..n {
+            assert!(b.send_chat(i.to_string()).unwrap().is_empty());
+        }
+        let mut got = Vec::new();
+        while got.len() < n {
+            let Event::Chat { text, .. } = wait_for(&arx, 20, |e| matches!(e, Event::Chat { .. })).await else {
+                unreachable!()
+            };
+            got.push(text.parse::<usize>().unwrap());
+        }
+        let took = start.elapsed();
+        println!("{n} messages in {took:?}");
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+        // 60 past the burst at 20/s: 3 s, minus what refills meanwhile.
+        assert!(took >= Duration::from_millis(2500), "{took:?}");
+        assert!(took < Duration::from_secs(8), "{took:?}");
+        a.leave();
+        b.leave();
     }
 
     /// Two peers over the real network: chat, then a test-pattern stream.
@@ -2239,7 +2630,7 @@ mod tests {
 
     /// Two nodes, A streams its real screen to B. Settings from the
     /// environment: BIBICORD_TEST_CODEC=hevc, BIBICORD_TEST_MAX_HEIGHT=720.
-    async fn screen_stream() -> (Node, std::sync::mpsc::Receiver<Event>, Node, std::sync::mpsc::Receiver<Event>) {
+    async fn screen_stream() -> (Node, EventRx, Node, EventRx) {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
         unsafe {
             std::env::set_var("BIBICORD_FAKE_AUDIO", "1");
@@ -2296,7 +2687,7 @@ mod tests {
         let mut longest_gap = Duration::ZERO;
         let mut count = slot.count();
         while start.elapsed() < Duration::from_secs(secs) {
-            while let Ok(e) = arx.try_recv() {
+            while let Some(e) = arx.try_recv() {
                 assert!(!matches!(e, Event::Error(_) | Event::MyStream(None)), "stream ended: {e:?}");
             }
             if let Some(f) = slot.take() {
