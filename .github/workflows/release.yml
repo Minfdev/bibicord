@@ -64,6 +64,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Debug: with LTO the release test binary takes ~3 min to link.
       - run: cargo test
+      # PRs and pushes: the NSIS script (license page, silent install) with
+      # dummy binaries; the full installer is built only for releases.
+      - name: Installer smoke test
+        if: env.INSTALLERS != 'true'
+        shell: bash
+        run: |
+          export PATH="/c/Program Files (x86)/NSIS:$PATH"
+          command -v makensis || choco install nsis -y --no-progress
+          scripts/check-windows-installer.sh
       - uses: taiki-e/install-action@v2
         if: env.INSTALLERS == 'true'
         with:

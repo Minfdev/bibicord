@@ -17,6 +17,9 @@ cat <<'MD'
 | macOS 14+ (Apple Silicon) | [BibiCord.dmg](https://github.com/Minfdev/bibicord/releases/latest/download/BibiCord.dmg) |
 
 Masz już BibiCord? Aplikacja sama zaproponuje aktualizację.
+Na macOS wersje do 0.4.0 nie potrafią zaakceptować umowy licencyjnej
+z DMG: gdy aktualizacja kończy się błędem „nie udało się otworzyć pliku
+DMG”, pobierz `BibiCord.dmg` i zainstaluj ręcznie (jednorazowo).
 
 **Pierwsza instalacja** (aplikacja nie jest podpisana certyfikatem wydawcy):
 - Windows: SmartScreen → „Więcej informacji” → „Uruchom mimo to”.

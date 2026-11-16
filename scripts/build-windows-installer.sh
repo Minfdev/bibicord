@@ -31,6 +31,8 @@ cp "$FF" "$STAGE/ffmpeg.exe"
 cp packaging/icon/icon.ico "$STAGE/"
 scripts/licenses.sh "$STAGE/licenses" "$TARGET"
 scripts/ffmpeg-notice.sh "$STAGE/licenses" "$FF" "$VERSION"
+# Shown on the license page (not installed; licenses/BibiCord-MIT.txt is).
+scripts/installer-license.sh "$STAGE/license.txt"
 
 OUT="dist/BibiCord-Setup-$VERSION.exe"
 ROOT=$(pwd -W 2>/dev/null || pwd)  # Git Bash on Windows needs a native path

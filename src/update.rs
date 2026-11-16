@@ -9,7 +9,9 @@
 //!   installer closes the app, replaces the files and starts it again.
 //! * macOS: mount the DMG, copy `BibiCord.app` next to the running bundle
 //!   (`ditto`), swap it in, relaunch. Files written by the app itself are not
-//!   quarantined, so Gatekeeper does not ask again.
+//!   quarantined, so Gatekeeper does not ask again. The DMG's license
+//!   agreement is accepted on the user's behalf (they accepted it when
+//!   installing).
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -249,7 +251,7 @@ fn install(file: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install(file: &Path) -> Result<()> {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     let bundle = std::env::current_exe()?
         .ancestors()
         .find(|p| p.extension().is_some_and(|e| e == "app"))
@@ -258,13 +260,25 @@ fn install(file: &Path) -> Result<()> {
     let parent = bundle.parent().context("brak folderu aplikacji")?;
     let mnt = file.with_extension("mnt");
     let _ = std::fs::create_dir_all(&mnt);
-    let ok = Command::new("hdiutil")
-        .args(["attach", "-nobrowse", "-readonly", "-quiet", "-mountpoint"])
+    // The DMG has a license agreement (packaging/macos/dmg_settings.py):
+    // hdiutil prints it and asks "Agree Y/N?" on stdin, which for an app
+    // started from Finder is /dev/null, so the attach would be declined.
+    // Answer "Y", then close stdin: an unexpected prompt fails, never hangs.
+    // stdout (mount table, license text) is not needed.
+    let mut child = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
         .arg(&mnt)
         .arg(file)
-        .status()?
-        .success();
-    if !ok {
+        .env("PAGER", "cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("nie udało się uruchomić hdiutil")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // Fails only if hdiutil already exited (e.g. no prompt to answer).
+        let _ = stdin.write_all(b"Y\n");
+    }
+    if !child.wait()?.success() {
         bail!("nie udało się otworzyć pliku DMG");
     }
     let staged = parent.join(".BibiCord-update.app");
