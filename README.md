@@ -14,6 +14,11 @@ Minimalistyczny komunikator dla znajomych w Ruście, inspirowany Discordem,
 Linki zawsze wskazują najnowszą wersję. Zainstalowana aplikacja sama
 proponuje aktualizację. Wszystkie wersje: [Releases](https://github.com/Minfdev/bibicord/releases).
 
+Przed instalacją oba instalatory pokazują licencję MIT (z podsumowaniem po
+polsku), którą trzeba zaakceptować przyciskiem „Zgadzam się”: Windows na
+stronie instalatora, macOS przy otwieraniu DMG. Aktualizacje w aplikacji
+jej nie pokazują.
+
 ![Oglądanie streamu](docs/screenshots/4-watch.png)
 
 ## Interfejs
@@ -116,8 +121,14 @@ pobierane przy pierwszym uruchomieniu):
   deinstalacja z „Aplikacje i funkcje”. Ponowne uruchomienie instalatora
   aktualizuje aplikację. Na macOS budowany krzyżowo (`brew install mingw-w64
   makensis nasm cmake pkgconf`, `rustup target add x86_64-pc-windows-gnu`).
-* **macOS** – obraz DMG: otwórz i przeciągnij BibiCord do folderu Aplikacje.
+* **macOS** – obraz DMG: otwórz, zaakceptuj licencję i przeciągnij BibiCord
+  do folderu Aplikacje.
   FFmpeg buduje się ze źródeł (`brew install cmake pkgconf`).
+
+Tekst licencji do akceptacji (podsumowanie po polsku i pełny tekst MIT)
+generuje `scripts/installer-license.sh`. Sam plik `LICENSE` jest instalowany
+razem z aplikacją jako `licenses/BibiCord-MIT.txt` (macOS:
+`BibiCord.app/Contents/Resources/licenses/`).
 
 Oba skrypty wymagają `cargo-about` (`cargo install cargo-about --locked
 --features cli`): generuje licencje bibliotek do folderu `licenses`
@@ -145,6 +156,11 @@ Kliknięcie pobiera instalator, sprawdza jego sumę SHA-256 z
 
 * Windows: `BibiCord-Setup.exe /S /RESTART` – cicha instalacja i restart.
 * macOS: nowa paczka `.app` z DMG zastępuje starą, aplikacja startuje ponownie.
+  Umowę licencyjną DMG aplikacja akceptuje sama (`Y` dla `hdiutil attach`).
+  Wersje do 0.4.0 tego nie potrafią: ich aktualizacja do wersji z umową
+  kończy się błędem „nie udało się otworzyć pliku DMG” (także po ponowieniu).
+  Nową wersję trzeba wtedy raz zainstalować ręcznie z
+  [Releases](https://github.com/Minfdev/bibicord/releases/latest).
 
 Gdy wydanie nie ma `SHA256SUMS.txt` albo poprawnej sumy instalatora (lub
 suma się nie zgadza), instalacja jest przerywana.
