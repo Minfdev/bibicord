@@ -74,6 +74,19 @@ pub struct StreamInfo {
     pub encoder: String,
 }
 
+/// Longest encoder name, in characters (shown, never used).
+pub const MAX_ENCODER: usize = 64;
+
+/// A peer's stream info with its encoder name bounded.
+pub fn clean_stream_info(info: Option<StreamInfo>) -> Option<StreamInfo> {
+    info.map(|mut i| {
+        if let Some((cut, _)) = i.encoder.char_indices().nth(MAX_ENCODER) {
+            i.encoder.truncate(cut);
+        }
+        i
+    })
+}
+
 /// Proof sent before anything else on a connection (see `proof`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Auth {
@@ -158,18 +171,33 @@ pub fn clean_file_name(name: &str) -> String {
     if ext.is_empty() { stem.to_string() } else { format!("{stem}.{ext}") }
 }
 
+/// `msg` as a frame (length prefix included), encoded once and shared by
+/// every peer it is queued for.
+pub fn encode_msg(msg: &Msg) -> Result<bytes::Bytes> {
+    let body = postcard::to_stdvec(msg)?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame.into())
+}
+
 pub async fn write_msg(w: &mut (impl AsyncWrite + Unpin), msg: &Msg) -> Result<()> {
-    let bytes = postcard::to_stdvec(msg)?;
-    w.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
-    w.write_all(&bytes).await?;
+    w.write_all(&encode_msg(msg)?).await?;
     Ok(())
 }
 
 pub async fn read_msg(r: &mut (impl AsyncRead + Unpin)) -> Result<Msg> {
+    Ok(read_frame(r).await?.0)
+}
+
+/// Next message and the bytes read for it (skipped frames included).
+pub async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<(Msg, usize)> {
     let mut len = [0u8; 4];
+    let mut total = 0;
     loop {
         r.read_exact(&mut len).await?;
         let len = u32::from_le_bytes(len) as usize;
+        total += 4 + len;
         if len > MAX_FRAME {
             // Skip it instead of dropping the peer (e.g. a too large file).
             tracing::warn!("skipping frame of {len} bytes");
@@ -181,7 +209,7 @@ pub async fn read_msg(r: &mut (impl AsyncRead + Unpin)) -> Result<Msg> {
         }
         let mut buf = vec![0u8; len];
         r.read_exact(&mut buf).await?;
-        return Ok(postcard::from_bytes(&buf)?);
+        return Ok((postcard::from_bytes(&buf)?, total));
     }
 }
 
@@ -380,6 +408,15 @@ mod tests {
         let writer = tokio::spawn(async move { write_msg(&mut a, &Msg::Chat { text: sent }).await.unwrap() });
         assert!(matches!(read_msg(&mut b).await.unwrap(), Msg::Chat { text: t } if t == text));
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn encoder_name_is_bounded() {
+        let info = |encoder: String| StreamInfo { codec: Codec::H264, width: 1, height: 1, fps: 1, bitrate_kbps: 1, encoder };
+        let long = clean_stream_info(Some(info("ż".repeat(1 << 19)))).unwrap();
+        assert_eq!(long.encoder, "ż".repeat(MAX_ENCODER));
+        assert_eq!(clean_stream_info(Some(info("h264_videotoolbox".into()))).unwrap().encoder, "h264_videotoolbox");
+        assert!(clean_stream_info(None).is_none());
     }
 
     #[test]

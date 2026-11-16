@@ -2,6 +2,7 @@
 
 use super::theme::{self, W, c, f, r, sp, ty};
 use super::widgets::{self as w, Avatar, Button, IconButton, Kind, ic};
+use super::history::Layout;
 use super::{App, ChatItem, ChatKind};
 use crate::proto::{self, MAX_CHAT_BYTES, MAX_FILE_BYTES};
 use eframe::egui::{self, Align2, Key, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
@@ -26,16 +27,34 @@ impl App {
                 bottom: sp::XL as i8,
             }))
             .show(ui, |ui| self.composer(ui));
+        let demo_scroll = self.demo.as_mut().and_then(|d| d.scroll.take_frame());
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(c::BG_CONTENT))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = Vec2::ZERO;
-                        self.messages(ui, side);
-                    });
+                let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true);
+                // Stuck to the bottom, egui overrides this.
+                let shift = std::mem::take(&mut self.chat_scroll.1);
+                if let Some((s, offset)) = self.chat_scroll.0
+                    && s == side
+                    && shift != 0.0
+                {
+                    area = area.vertical_scroll_offset((offset - shift).max(0.0));
+                }
+                if let Some(offset) = demo_scroll {
+                    area = area.vertical_scroll_offset(offset).stick_to_bottom(false);
+                }
+                let out = area.show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    let start = Instant::now();
+                    self.messages(ui, side);
+                    let took = start.elapsed();
+                    let entries = self.chat.len();
+                    if let Some(d) = self.demo.as_mut().filter(|d| d.timing) {
+                        d.sample(entries, took);
+                        ui.ctx().request_repaint();
+                    }
+                });
+                self.chat_scroll.0 = Some((side, out.state.unclamped_offset().y));
             });
     }
 
@@ -103,38 +122,73 @@ impl App {
         ui.add_space(sp::S);
 
         let my_color = self.my_color();
+        let scale = ui.ctx().pixels_per_point();
         let mut prev: Option<(Option<iroh::EndpointId>, chrono::DateTime<chrono::Local>)> = None;
         let mut save = None;
         for (i, item) in self.chat.iter().enumerate() {
-            let ChatItem { kind, time } = item;
-            match kind {
-                ChatKind::Message { from, name, .. } | ChatKind::File { from, name, .. } => {
-                    let grouped = prev.is_some_and(|(pf, pt)| pf == *from && (*time - pt).num_minutes() < 5);
-                    let (color, avatar) = match from {
-                        Some(id) => match self.peer(id) {
-                            Some(p) => (p.color, p.avatar.as_ref()),
-                            None => (theme::avatar_color(id.as_bytes()), self.gone_avatars.get(id)),
-                        },
-                        None => (my_color, self.my_avatar_tex.as_ref()),
-                    };
-                    message(ui, name, color, avatar, *time, grouped, width, |ui| match kind {
-                        ChatKind::Message { text, .. } => {
-                            ui.add(egui::Label::new(w::text(text, ty::BODY, c::TEXT_BODY)).wrap().selectable(true));
-                        }
-                        ChatKind::File { file_name, data, saved, .. } => {
-                            if file_card(ui, file_name, data.len(), *saved) {
-                                save = Some(i);
-                            }
-                        }
-                        ChatKind::System { .. } => {}
-                    });
-                    prev = Some((*from, *time));
+            let ChatItem { id, kind, time, layout } = item;
+            let grouped = match kind {
+                ChatKind::Message { from, .. } | ChatKind::File { from, .. } => {
+                    prev.is_some_and(|(pf, pt)| pf == *from && (*time - pt).num_minutes() < 5)
                 }
-                ChatKind::System { icon, who, text, good } => {
-                    system_line(ui, icon, who, text, *good, *time, width);
-                    prev = None;
-                }
+                ChatKind::System { .. } => false,
+            };
+            prev = match kind {
+                ChatKind::Message { from, .. } | ChatKind::File { from, .. } => Some((*from, *time)),
+                ChatKind::System { .. } => None,
+            };
+            // Off screen: only its space, as long as it was last drawn the
+            // same way (width, scale, grouping; a trimmed history can make
+            // the first message ungrouped).
+            let top = ui.cursor().min;
+            let key = Layout { width, scale, grouped, height: 0.0 };
+            if let Some(l) = layout.get().filter(|l| Layout { height: 0.0, ..*l } == key)
+                && !ui.is_rect_visible(Rect::from_min_size(top, Vec2::new(width, l.height)))
+            {
+                ui.add_space(l.height);
+                continue;
             }
+            ui.scope_builder(UiBuilder::new().id_salt(id), |ui| {
+                match kind {
+                    ChatKind::Message { from, name, .. } | ChatKind::File { from, name, .. } => {
+                        let (color, avatar) = match from {
+                            Some(id) => match self.peer(id) {
+                                Some(p) => (p.color, p.avatar.as_ref()),
+                                None => (theme::avatar_color(id.as_bytes()), self.gone_avatars.get(id)),
+                            },
+                            None => (my_color, self.my_avatar_tex.as_ref()),
+                        };
+                        message(ui, name, color, avatar, *time, grouped, width, |ui| match kind {
+                            ChatKind::Message { text, .. } => {
+                                ui.add(egui::Label::new(w::text(text, ty::BODY, c::TEXT_BODY)).wrap().selectable(true));
+                            }
+                            ChatKind::File { file_name, size, data, saved, .. } => {
+                                if file_card(ui, file_name, *size, data.is_some(), *saved) {
+                                    save = Some(i);
+                                }
+                            }
+                            ChatKind::System { .. } => {}
+                        });
+                    }
+                    ChatKind::System { icon, who, text, good } => {
+                        system_line(ui, icon, who, text, *good, *time, width);
+                    }
+                }
+            });
+            let height = ui.cursor().min.y - top.y;
+            // Laid out again above the view at another height (e.g. the
+            // first message after a trim loses its grouping): what is being
+            // read stays put. This frame the cursor steps back by the change
+            // (the overlap is out of sight); from the next frame on the
+            // scroll offset makes up for it.
+            if let Some(old) = layout.get()
+                && top.y + height <= ui.clip_rect().top()
+                && height != old.height
+            {
+                self.chat_scroll.1 -= height - old.height;
+                ui.add_space(old.height - height);
+            }
+            layout.set(Some(Layout { height, ..key }));
         }
         ui.add_space(sp::L);
         if let Some(i) = save {
@@ -144,7 +198,8 @@ impl App {
 
     /// Asks where to save chat file `i`; nothing is written without it.
     fn save_file(&mut self, i: usize) {
-        let Some(ChatItem { kind: ChatKind::File { file_name, data, saved, .. }, .. }) = self.chat.get_mut(i) else {
+        let Some(ChatItem { kind: ChatKind::File { file_name, data: Some(data), saved, .. }, .. }) = self.chat.get_mut(i)
+        else {
             return;
         };
         // `file_name` is cleaned (no path), so it only pre-fills the dialog.
@@ -165,7 +220,13 @@ impl App {
             Ok(m) if m.is_dir() => Err("Można wysyłać tylko pliki, nie foldery.".to_string()),
             Ok(m) if m.len() > MAX_FILE_BYTES as u64 => Err(TOO_BIG.to_string()),
             Ok(_) => match std::fs::read(path) {
-                Ok(data) => self.node.send_file(&name, data).map_err(|e| e.to_string()),
+                Ok(data) => match self.node.send_file(&name, data) {
+                    Ok(skipped) => {
+                        self.undelivered(&format!("pliku „{}”", proto::clean_file_name(&name)), skipped);
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
                 Err(e) => Err(format!("Nie udało się odczytać pliku „{name}”: {e}")),
             },
             Err(e) => Err(format!("Nie udało się odczytać pliku „{name}”: {e}")),
@@ -256,9 +317,13 @@ impl App {
         }
         if send {
             let text = self.chat_input.trim().to_string();
-            let res = if text.is_empty() { Ok(()) } else { self.node.send_chat(text) };
+            let res = if text.is_empty() { Ok(Vec::new()) } else { self.node.send_chat(text) };
             match res {
-                Ok(()) => self.chat_input.clear(),
+                // In our history either way; who didn't get it is told apart.
+                Ok(skipped) => {
+                    self.chat_input.clear();
+                    self.undelivered("wiadomości", skipped);
+                }
                 Err(e) => self.error = Some((e.to_string(), Instant::now())),
             }
             ui.memory_mut(|m| m.request_focus(id));
@@ -338,7 +403,8 @@ fn file_size(n: usize) -> String {
 }
 
 /// File attachment in a message; returns true when "Zapisz" is clicked.
-fn file_card(ui: &mut egui::Ui, file_name: &str, len: usize, saved: bool) -> bool {
+/// Without `available` data (dropped from a long history) it can't be saved.
+fn file_card(ui: &mut egui::Ui, file_name: &str, len: usize, available: bool, saved: bool) -> bool {
     let mut clicked = false;
     ui.add_space(sp::XS);
     egui::Frame::new()
@@ -350,17 +416,27 @@ fn file_card(ui: &mut egui::Ui, file_name: &str, len: usize, saved: bool) -> boo
             ui.set_width((ui.available_width()).min(420.0));
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(sp::M, 0.0);
-                ui.label(w::icon(ic::FILE, 30.0, c::TEXT_SECONDARY));
+                let icon = if available { ic::FILE } else { ic::FILE_DASHED };
+                ui.label(w::icon(icon, 30.0, if available { c::TEXT_SECONDARY } else { c::TEXT_MUTED }));
                 // Narrow chat next to the voice stage: icon-only button.
                 let compact = ui.available_width() < 300.0;
-                let button_w = if compact { 34.0 } else { 112.0 };
+                let button_w = if !available { 0.0 } else if compact { 34.0 } else { 112.0 };
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width() - button_w - sp::M);
                     ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
-                    ui.add(egui::Label::new(w::text(file_name, (15.0, W::SemiBold), c::TEXT)).truncate())
+                    let col = if available { c::TEXT } else { c::TEXT_MUTED };
+                    ui.add(egui::Label::new(w::text(file_name, (15.0, W::SemiBold), col)).truncate())
                         .on_hover_text(file_name);
-                    ui.label(w::text(file_size(len), ty::CAPTION, c::TEXT_MUTED));
+                    if available {
+                        ui.label(w::text(file_size(len), ty::CAPTION, c::TEXT_MUTED));
+                    } else {
+                        ui.label(w::text(format!("Plik już niedostępny · {}", file_size(len)), ty::CAPTION, c::TEXT_MUTED))
+                            .on_hover_text("Długa historia czatu nie mieści się w pamięci: najstarsze pliki są z niej usuwane.");
+                    }
                 });
+                if !available {
+                    return;
+                }
                 let (label, icon, kind) =
                     if saved { ("Zapisano", ic::CHECK, Kind::Success) } else { ("Zapisz", ic::DOWNLOAD_SIMPLE, Kind::Secondary) };
                 let tip = if saved { "Zapisano, zapisz ponownie" } else { "Zapisz plik na dysku" };

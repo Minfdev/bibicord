@@ -354,7 +354,7 @@ impl Voice {
     /// Starts capture + playback. Encoded packets (with sequence number
     /// prefix) are sent to `packets`.
     pub fn start(
-        packets: mpsc::UnboundedSender<Bytes>,
+        packets: mpsc::Sender<Bytes>,
         devices: Devices,
         muted: bool,
         deafened: bool,
@@ -555,10 +555,23 @@ fn fake_audio() -> bool {
     cfg!(test) || std::env::var_os("BIBICORD_FAKE_AUDIO").is_some()
 }
 
+/// Encoded packets waiting to go out: about 1 s of audio.
+pub const PACKET_QUEUE: usize = 64;
+
+pub fn packet_channel() -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+    mpsc::channel(PACKET_QUEUE)
+}
+
+/// Never blocks the audio callback: when the network side falls behind,
+/// the packet is dropped (late voice is useless anyway).
+fn send_packet(packets: &mpsc::Sender<Bytes>, pkt: Bytes) {
+    let _ = packets.try_send(pkt);
+}
+
 /// Encoder side: takes mono samples at `in_rate`, sends Opus packets.
 fn capture_pipeline(
     shared: Arc<Shared>,
-    packets: mpsc::UnboundedSender<Bytes>,
+    packets: mpsc::Sender<Bytes>,
     in_rate: u32,
 ) -> Result<impl FnMut(&[f32]) + Send + 'static> {
     let mut enc = opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip)?;
@@ -625,9 +638,9 @@ fn capture_pipeline(
             for p in preroll.drain(..) {
                 let mut p = p.to_vec();
                 p[2] |= FLAG_PREROLL;
-                let _ = packets.send(Bytes::from(p));
+                send_packet(&packets, Bytes::from(p));
             }
-            let _ = packets.send(pkt);
+            send_packet(&packets, pkt);
         }
     })
 }
@@ -653,7 +666,7 @@ fn mixer(shared: Arc<Shared>, out_rate: u32) -> impl FnMut(usize) -> Vec<f32> + 
 
 /// Test mode without audio devices. With `BIBICORD_FAKE_TONE` the
 /// "microphone" plays a tone that alternates between speech and silence.
-fn run_fake(shared: Arc<Shared>, packets: mpsc::UnboundedSender<Bytes>, stop: Arc<AtomicBool>) {
+fn run_fake(shared: Arc<Shared>, packets: mpsc::Sender<Bytes>, stop: Arc<AtomicBool>) {
     let Ok(mut capture) = capture_pipeline(shared.clone(), packets, RATE) else { return };
     let mut mix = mixer(shared, RATE);
     let tone = std::env::var_os("BIBICORD_FAKE_TONE").is_some();
@@ -691,7 +704,7 @@ fn find_device(host: &cpal::Host, id: Option<&str>, input: bool) -> Option<cpal:
 
 fn run_audio(
     shared: Arc<Shared>,
-    packets: mpsc::UnboundedSender<Bytes>,
+    packets: mpsc::Sender<Bytes>,
     devices: &Devices,
 ) -> Result<(cpal::Stream, cpal::Stream)> {
     let host = cpal::default_host();
@@ -857,7 +870,7 @@ pub(crate) mod sim {
     pub fn run(net: &Net, secs: f64) -> Report {
         // Network simulation: the synthetic tone is not run through RNNoise.
         let shared = |_| Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, sensitivity: None }));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = packet_channel();
         let mut capture = capture_pipeline(shared(0), tx, RATE).unwrap();
         let rx_voice = Voice { shared: shared(1), stop: Arc::new(AtomicBool::new(false)) };
         let mut mix = mixer(rx_voice.shared.clone(), RATE);
@@ -1123,7 +1136,7 @@ mod tests {
     fn manual_threshold_gates() {
         let sent = |threshold| {
             let shared = Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, sensitivity: Some(threshold) }));
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = packet_channel();
             let mut capture = capture_pipeline(shared.clone(), tx, RATE).unwrap();
             for k in 0..50 {
                 let frame: Vec<f32> = (0..FRAME)
@@ -1137,6 +1150,27 @@ mod tests {
         };
         assert!(sent(-40) >= 49);
         assert_eq!(sent(-20), 0);
+    }
+
+    /// Nobody takes the packets (stalled network task): capture keeps
+    /// running without blocking, and only `PACKET_QUEUE` packets are held.
+    #[test]
+    fn full_packet_queue_drops() {
+        let (tx, mut rx) = packet_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let shared = Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, sensitivity: Some(-40) }));
+            let mut capture = capture_pipeline(shared, tx.clone(), RATE).unwrap();
+            for k in 0..PACKET_QUEUE * 4 {
+                let frame: Vec<f32> = (0..FRAME)
+                    .map(|i| 0.0447 * ((k * FRAME + i) as f32 / RATE as f32 * 2.0 * std::f32::consts::PI * 220.0).sin())
+                    .collect();
+                capture(&frame);
+            }
+            let _ = done_tx.send(tx);
+        });
+        let _tx = done_rx.recv_timeout(Duration::from_secs(10)).expect("capture blocked or panicked");
+        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).count(), PACKET_QUEUE);
     }
 
     #[test]
