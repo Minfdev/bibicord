@@ -456,6 +456,11 @@ impl App {
                         self.cue(if on { Cue::Connect } else { Cue::Disconnect });
                     }
                     self.my_voice = on;
+                    if !on {
+                        // Cameras are part of the call: no frozen frame after leaving it.
+                        let me = self.my_id;
+                        self.cam_tex.retain(|id, _| Some(*id) == me);
+                    }
                 }
                 Event::Watching(w) => {
                     self.watching = w;

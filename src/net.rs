@@ -147,9 +147,12 @@ struct PeerConn {
     conn: Connection,
     ctrl: Arc<CtrlQueue>,
     dialer: EndpointId,
-    voice: bool,
+    /// Whether they are in voice; watched by our camera sender (`gated_camera`).
+    voice: tokio::sync::watch::Sender<bool>,
     stream: Option<StreamInfo>,
     camera: Option<StreamInfo>,
+    /// Their latest request for our camera; a new one replaces it.
+    cam_serve: Option<tokio::task::AbortHandle>,
 }
 
 /// Local mute/deafen state, kept even when not in voice.
@@ -547,9 +550,7 @@ impl Node {
         s.dialing.clear();
         s.broadcast = None;
         s.camera = None;
-        for (_, (_, task)) in s.cam_views.drain() {
-            task.abort();
-        }
+        Self::close_views(s);
         if let Some(w) = s.watch.take() {
             w.task.abort();
         }
@@ -903,9 +904,10 @@ impl Node {
                     conn: conn.clone(),
                     ctrl: ctrl.clone(),
                     dialer,
-                    voice,
+                    voice: tokio::sync::watch::Sender::new(voice),
                     stream: stream.clone(),
                     camera: None,
+                    cam_serve: None,
                 },
             );
             reply
@@ -962,9 +964,22 @@ impl Node {
                     if r.read_exact(&mut tag).await.is_err() {
                         continue;
                     }
-                    if tag[0] == TAG_WATCH || tag[0] == TAG_CAMERA {
+                    if tag[0] == TAG_WATCH {
                         let n = n.clone();
-                        tokio::spawn(async move { n.serve_viewer(s, tag[0] == TAG_CAMERA).await });
+                        tokio::spawn(async move { n.serve_viewer(s).await });
+                    } else if tag[0] == TAG_CAMERA {
+                        let (n2, c2) = (n.clone(), conn.clone());
+                        let task = tokio::spawn(async move { n2.serve_camera(remote, c2, s).await });
+                        let old = {
+                            let mut st = n.0.state.lock().unwrap();
+                            match st.peers.get_mut(&remote).filter(|p| p.conn.stable_id() == stable) {
+                                Some(p) => p.cam_serve.replace(task.abort_handle()),
+                                None => Some(task.abort_handle()),
+                            }
+                        };
+                        if let Some(old) = old {
+                            old.abort();
+                        }
                     }
                 }
             });
@@ -1050,7 +1065,7 @@ impl Node {
                     {
                         let mut s = self.0.state.lock().unwrap();
                         if let Some(p) = s.peers.get_mut(&remote) {
-                            p.voice = on;
+                            p.voice.send_replace(on);
                         }
                         if !on {
                             if let Some(v) = &s.voice {
@@ -1183,11 +1198,8 @@ impl Node {
         s.broadcast.as_ref().map(|b| b.hub.viewer_count()).unwrap_or(0)
     }
 
-    async fn serve_viewer(&self, mut send: iroh::endpoint::SendStream, camera: bool) {
-        let hub = {
-            let s = self.0.state.lock().unwrap();
-            if camera { &s.camera } else { &s.broadcast }.as_ref().map(|b| b.hub.clone())
-        };
+    async fn serve_viewer(&self, mut send: iroh::endpoint::SendStream) {
+        let hub = self.0.state.lock().unwrap().broadcast.as_ref().map(|b| b.hub.clone());
         let Some(hub) = hub else {
             let _ = send.finish();
             return;
@@ -1198,6 +1210,26 @@ impl Node {
             if send.write_chunk(chunk).await.is_err() {
                 return;
             }
+        }
+        let _ = send.finish();
+    }
+
+    /// Serves our camera to `remote`, only while they are in voice.
+    async fn serve_camera(&self, remote: EndpointId, conn: Connection, mut send: iroh::endpoint::SendStream) {
+        let found = {
+            let s = self.0.state.lock().unwrap();
+            let voice = s.peers.get(&remote).filter(|p| p.conn.stable_id() == conn.stable_id()).map(|p| p.voice.subscribe());
+            voice.zip(s.camera.as_ref().map(|b| b.hub.clone()))
+        };
+        if let Some((voice, hub)) = found {
+            let stopped = send.stopped();
+            let end = async move {
+                tokio::select! {
+                    _ = conn.closed() => {}
+                    _ = stopped => {}
+                }
+            };
+            gated_camera(&hub, voice, end, &mut send).await;
         }
         let _ = send.finish();
     }
@@ -1271,27 +1303,46 @@ impl Node {
         s.cam_views.iter().map(|(id, (slot, _))| (*id, slot.clone())).collect()
     }
 
+    /// Records a peer's camera; it is received only while we are in voice.
     fn set_peer_camera(&self, id: EndpointId, info: Option<StreamInfo>) {
-        let conn = {
+        {
             let mut s = self.0.state.lock().unwrap();
             let Some(p) = s.peers.get_mut(&id) else { return };
             p.camera = info.clone();
-            let conn = p.conn.clone();
             if let Some((_, task)) = s.cam_views.remove(&id) {
                 task.abort();
             }
-            conn
-        };
-        if let Some(info) = &info {
-            // ponytail: every camera is received even when nobody looks at the
-            // voice stage; subscribe on demand if bandwidth becomes a problem.
-            self.view_camera(id, info.codec, async move {
+            self.view_missing(&mut s);
+        }
+        self.emit(Event::PeerCamera { id, on: info.is_some() });
+    }
+
+    /// In voice: starts receiving every peer camera that has no view yet.
+    /// Called when a camera appears and when (re)joining voice succeeds.
+    fn view_missing(&self, s: &mut State) {
+        if s.voice.is_none() {
+            return;
+        }
+        let missing: Vec<_> = s
+            .peers
+            .iter()
+            .filter(|(id, _)| !s.cam_views.contains_key(*id))
+            .filter_map(|(id, p)| Some((*id, p.camera.as_ref()?.codec, p.conn.clone())))
+            .collect();
+        for (id, codec, conn) in missing {
+            let view = self.spawn_view(codec, async move {
                 let (mut send, mut recv) = conn.open_bi().await?;
                 send.write_all(&[TAG_CAMERA]).await?;
                 let (tx, rx) = mpsc::channel(4);
                 tokio::spawn(async move {
                     let _send = send; // keep the request stream open
-                    while let Ok(Some(chunk)) = recv.read_chunk(1 << 20).await {
+                    loop {
+                        let chunk = tokio::select! {
+                            r = recv.read_chunk(1 << 20) => r,
+                            // The view is gone (e.g. we left voice): close the request.
+                            _ = tx.closed() => break,
+                        };
+                        let Ok(Some(chunk)) = chunk else { break };
                         if tx.send(chunk).await.is_err() {
                             break;
                         }
@@ -1299,8 +1350,15 @@ impl Node {
                 });
                 Ok(rx)
             });
+            s.cam_views.insert(id, view);
         }
-        self.emit(Event::PeerCamera { id, on: info.is_some() });
+    }
+
+    /// Closes every camera view, ours (preview) included.
+    fn close_views(s: &mut State) {
+        for (_, (_, task)) in s.cam_views.drain() {
+            task.abort();
+        }
     }
 
     /// Decodes a camera bitstream (from `source`) into a frame slot for `id`'s tile.
@@ -1310,6 +1368,18 @@ impl Node {
         codec: proto::Codec,
         source: impl std::future::Future<Output = Result<mpsc::Receiver<Bytes>>> + Send + 'static,
     ) {
+        let view = self.spawn_view(codec, source);
+        let old = self.0.state.lock().unwrap().cam_views.insert(id, view);
+        if let Some((_, t)) = old {
+            t.abort();
+        }
+    }
+
+    fn spawn_view(
+        &self,
+        codec: proto::Codec,
+        source: impl std::future::Future<Output = Result<mpsc::Receiver<Bytes>>> + Send + 'static,
+    ) -> (Arc<FrameSlot>, tokio::task::JoinHandle<()>) {
         let slot = Arc::new(FrameSlot::default());
         let events = self.0.events.clone();
         let slot2 = slot.clone();
@@ -1327,10 +1397,7 @@ impl Node {
                 tracing::debug!("camera view ended: {e:#}");
             }
         });
-        let old = self.0.state.lock().unwrap().cam_views.insert(id, (slot, task));
-        if let Some((_, t)) = old {
-            t.abort();
-        }
+        (slot, task)
     }
 
     pub fn watching(&self) -> Option<EndpointId> {
@@ -1413,13 +1480,16 @@ impl Node {
                     return; // cancelled or superseded; dropping the Voice stops it
                 }
                 s.voice_starting = false;
-                res.map(|r| {
+                let res = res.map(|r| {
                     r.map(|v| {
                         v.set_muted(s.mute.muted || s.mute.deafened);
                         v.set_deafened(s.mute.deafened);
                         s.voice = Some(Arc::new(v));
                     })
-                })
+                });
+                // Also cameras announced while a device change restarted voice.
+                n.view_missing(&mut s);
+                res
             };
             match res {
                 Ok(Ok(())) => {
@@ -1433,7 +1503,7 @@ impl Node {
                             d.extend_from_slice(&pkt);
                             let d = Bytes::from(d);
                             let s = n2.0.state.lock().unwrap();
-                            for p in s.peers.values().filter(|p| p.voice) {
+                            for p in s.peers.values().filter(|p| *p.voice.borrow()) {
                                 let _ = p.conn.send_datagram(d.clone());
                             }
                         }
@@ -1495,6 +1565,8 @@ impl Node {
         self.stop_camera(); // video is part of the call, as on Discord
         let (v, starting) = {
             let mut s = self.0.state.lock().unwrap();
+            // Always, even if voice is gone already: nothing is received after this.
+            Self::close_views(&mut s);
             s.voice_gen += 1;
             (s.voice.take(), std::mem::take(&mut s.voice_starting))
         };
@@ -1504,6 +1576,45 @@ impl Node {
             drop(v);
             self.broadcast_msg(Msg::Voice(false));
             self.emit(Event::MyVoice(false));
+        }
+    }
+}
+
+/// Sends `hub` to one camera viewer, only while `voice` (theirs) is true.
+/// While false it waits unsubscribed; when true again it subscribes anew,
+/// so the viewer continues from the current keyframe. Ends with the hub
+/// (camera off), a failed write or `end`; never times out, so a request
+/// that arrives before their `Voice(true)` is served once it comes.
+async fn gated_camera<W: tokio::io::AsyncWrite + Unpin>(
+    hub: &video::Hub,
+    mut voice: tokio::sync::watch::Receiver<bool>,
+    end: impl std::future::Future<Output = ()>,
+    out: &mut W,
+) {
+    use tokio::io::AsyncWriteExt;
+    tokio::pin!(end);
+    let closed = hub.closed();
+    tokio::pin!(closed);
+    loop {
+        // `biased`: ending and pausing win over sending, deterministically.
+        tokio::select! {
+            biased;
+            _ = &mut end => return,
+            _ = &mut closed => return,
+            ok = async { voice.wait_for(|v| *v).await.is_ok() } => if !ok { return },
+        }
+        let mut rx = hub.subscribe();
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = &mut end => return,
+                ok = async { voice.wait_for(|v| !*v).await.is_ok() } => if ok { break } else { return },
+                c = rx.recv() => c,
+            };
+            let Some(chunk) = chunk else { return };
+            if out.write_all(&chunk).await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -1665,8 +1776,315 @@ mod tests {
         b.leave();
     }
 
-    /// Camera next to a screen stream: peers (also late joiners) decode it
-    /// without asking, the sender sees a preview, leaving voice stops it.
+    fn nal(header: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 1, header];
+        v.extend(std::iter::repeat_n(0xAB, len));
+        v
+    }
+
+    fn gop() -> Bytes {
+        Bytes::from([nal(0x67, 10), nal(0x68, 4), nal(0x65, 100)].concat())
+    }
+
+    /// Everything readable from `r` within `ms`.
+    async fn drain(r: &mut tokio::io::DuplexStream, ms: u64) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(ms), r.read(&mut buf)).await {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// The camera sender's gate, without the network: nothing (and no hub
+    /// subscription) while the viewer is out of voice, the current keyframe
+    /// whenever they come back, and an end when the camera goes off.
+    #[tokio::test]
+    async fn gated_camera_follows_voice() {
+        let hub = Arc::new(video::Hub::new(proto::Codec::H264));
+        hub.push(gop());
+        let (voice, vrx) = tokio::sync::watch::channel(false);
+        let (mut w, mut r) = tokio::io::duplex(1 << 20);
+        let h = hub.clone();
+        let task = tokio::spawn(async move { gated_camera(&h, vrx, std::future::pending(), &mut w).await });
+
+        // A request before their `Voice(true)`: waits, unsubscribed.
+        assert!(drain(&mut r, 300).await.is_empty());
+        assert_eq!(hub.viewer_count(), 0);
+        voice.send_replace(true);
+        let got = drain(&mut r, 300).await;
+        assert_eq!(got, gop(), "starts at the keyframe");
+        assert_eq!(hub.viewer_count(), 1);
+        hub.push(Bytes::from(nal(0x41, 20)));
+        assert_eq!(drain(&mut r, 300).await, nal(0x41, 20));
+
+        // Out of voice: unsubscribed, nothing more sent.
+        voice.send_replace(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hub.viewer_count(), 0);
+        hub.push(Bytes::from(nal(0x41, 21)));
+        assert!(drain(&mut r, 300).await.is_empty());
+
+        // Back: the same stream continues from the current keyframe.
+        voice.send_replace(true);
+        let got = drain(&mut r, 300).await;
+        assert!(got.starts_with(&[0, 0, 0, 1, 0x67]), "{:?}", &got[..got.len().min(8)]);
+        assert!(got.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]));
+
+        // Camera off while waiting ends the request.
+        voice.send_replace(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.close();
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("still waiting").unwrap();
+        assert!(drain(&mut r, 100).await.is_empty(), "stream not ended");
+    }
+
+    /// A chunk and the viewer leaving voice at the same moment: the chunk
+    /// is never sent (pausing wins over sending).
+    #[tokio::test]
+    async fn gated_camera_pause_wins() {
+        let hub = Arc::new(video::Hub::new(proto::Codec::H264));
+        hub.push(gop());
+        let (voice, vrx) = tokio::sync::watch::channel(true);
+        let (mut w, mut r) = tokio::io::duplex(1 << 20);
+        let h = hub.clone();
+        tokio::spawn(async move { gated_camera(&h, vrx, std::future::pending(), &mut w).await });
+        for i in 0..50 {
+            voice.send_replace(true);
+            let t = Instant::now();
+            while hub.viewer_count() != 1 {
+                assert!(t.elapsed() < Duration::from_secs(1), "round {i}: not subscribed");
+                tokio::task::yield_now().await;
+            }
+            drain(&mut r, 50).await; // the keyframe it starts with
+            hub.push(Bytes::from(nal(0x41, 20)));
+            voice.send_replace(false);
+            let t = Instant::now();
+            while hub.viewer_count() != 0 {
+                assert!(t.elapsed() < Duration::from_secs(1), "round {i}: not paused");
+                tokio::task::yield_now().await;
+            }
+            let got = drain(&mut r, 20).await;
+            assert!(got.is_empty(), "round {i}: sent {} B after leaving voice", got.len());
+        }
+    }
+
+    /// The request also ends while waiting when the viewer goes (`end`), or
+    /// their connection state is gone (sender dropped).
+    #[tokio::test]
+    async fn gated_camera_ends() {
+        let hub = video::Hub::new(proto::Codec::H264);
+        let (voice, vrx) = tokio::sync::watch::channel(false);
+        let (mut w, _r) = tokio::io::duplex(1 << 16);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let end = async move {
+            let _ = rx.await;
+        };
+        let t = tokio::spawn(async move { gated_camera(&hub, vrx, end, &mut w).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!t.is_finished());
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), t).await.expect("end ignored").unwrap();
+
+        let hub = video::Hub::new(proto::Codec::H264);
+        let (mut w, _r) = tokio::io::duplex(1 << 16);
+        let vrx = voice.subscribe();
+        drop(voice);
+        let t = tokio::spawn(async move { gated_camera(&hub, vrx, std::future::pending(), &mut w).await });
+        tokio::time::timeout(Duration::from_secs(1), t).await.expect("voice gone ignored").unwrap();
+    }
+
+    /// Camera tests: A (in voice, camera on) and B in a room.
+    async fn camera_pair() -> (Node, EventRx, Node, EventRx, EndpointId) {
+        unsafe {
+            std::env::set_var("BIBICORD_TEST_SOURCE", "1");
+            std::env::set_var("BIBICORD_FAKE_AUDIO", "1");
+        }
+        tokio::task::spawn_blocking(|| crate::ffmpeg::ensure(|_| {})).await.unwrap().unwrap();
+        let (a, arx) = node();
+        let (b, brx) = node();
+        a.create_room("Ala".into(), "Test".into());
+        join_ok(&b, &brx, &ticket(&arx).await).await;
+        let ida = a.my_id().unwrap();
+        a.join_voice();
+        wait_for(&arx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        a.start_camera(None);
+        wait_for(&arx, 60, |e| matches!(e, Event::MyCamera(true))).await;
+        wait_for(&brx, 20, |e| matches!(e, Event::PeerCamera { id, on: true } if *id == ida)).await;
+        wait_cam_frames(&a, ida, 5).await; // preview
+        (a, arx, b, brx, ida)
+    }
+
+    /// Subscribers of `n`'s camera hub other than its own preview.
+    fn cam_viewers(n: &Node) -> usize {
+        let s = n.0.state.lock().unwrap();
+        s.camera.as_ref().map_or(0, |b| b.hub.viewer_count()).saturating_sub(1)
+    }
+
+    async fn wait_cam_viewers(n: &Node, want: usize) {
+        let t = Instant::now();
+        while cam_viewers(n) != want {
+            assert!(t.elapsed() < Duration::from_secs(10), "camera viewers: {}, want {want}", cam_viewers(n));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn has_view(n: &Node, id: EndpointId) -> bool {
+        n.camera_frames().iter().any(|(i, _)| *i == id)
+    }
+
+    /// (#43) Cameras are part of the call: not received outside voice,
+    /// received on joining without the sender toggling anything, closed
+    /// (on both sides) on leaving, back after a quick leave and rejoin.
+    /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg cargo test e2e_camera_voice -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_camera_voice_only() {
+        let (a, _arx, b, brx, ida) = camera_pair().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!has_view(&b, ida), "received outside voice");
+        assert_eq!(cam_viewers(&a), 0, "sent outside voice");
+
+        b.join_voice();
+        wait_for(&brx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        wait_cam_frames(&b, ida, 10).await;
+        wait_cam_viewers(&a, 1).await;
+
+        // The sender believes B left and came back: B's stream gets a new
+        // keyframe in the middle and its decoder carries on.
+        let idb = b.my_id().unwrap();
+        push_raw(&b, ida, Msg::Voice(false));
+        wait_cam_viewers(&a, 0).await;
+        push_raw(&b, ida, Msg::Voice(true));
+        wait_cam_viewers(&a, 1).await;
+        let before = cam_count(&b, ida);
+        wait_cam_frames(&b, ida, before + 20).await;
+
+        b.leave_voice();
+        assert!(!has_view(&b, ida), "view kept after leaving voice");
+        wait_cam_viewers(&a, 0).await;
+        let t = Instant::now();
+        while !a.0.state.lock().unwrap().peers[&idb].cam_serve.as_ref().is_some_and(|h| h.is_finished()) {
+            assert!(t.elapsed() < Duration::from_secs(10), "sender still serving B");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Back in, without the sender doing anything.
+        b.join_voice();
+        wait_for(&brx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        wait_cam_frames(&b, ida, 10).await;
+
+        // Quick leave and rejoin: the new request may reach A before
+        // the `Voice(false)`; it still ends with a picture.
+        b.leave_voice();
+        b.join_voice();
+        wait_for(&brx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        wait_cam_frames(&b, ida, 10).await;
+        let before = cam_count(&b, ida);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        wait_cam_frames(&b, ida, before + 20).await;
+        wait_cam_viewers(&a, 1).await;
+        a.leave();
+        b.leave();
+    }
+
+    /// (#43) A modified client asking for the camera while out of voice gets
+    /// nothing; once it says `Voice(true)` the same request gets video
+    /// (also covers a request arriving before `Voice(true)`). A new request
+    /// replaces the old one; `Voice(false)` pauses it and `Voice(true)`
+    /// resumes it at a keyframe.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_camera_sender_refuses() {
+        let (a, _arx, b, _brx, ida) = camera_pair().await;
+        let conn = b.0.state.lock().unwrap().peers[&ida].conn.clone();
+        async fn request(conn: &Connection) -> (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            send.write_all(&[TAG_CAMERA]).await.unwrap();
+            (send, recv)
+        }
+        async fn read_for(recv: &mut iroh::endpoint::RecvStream, ms: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            let end = Instant::now() + Duration::from_millis(ms);
+            while let Ok(Ok(Some(c))) = tokio::time::timeout_at(end.into(), recv.read_chunk(1 << 20)).await {
+                out.extend_from_slice(&c);
+            }
+            out
+        }
+        let (_s1, mut r1) = request(&conn).await;
+        assert!(read_for(&mut r1, 4000).await.is_empty(), "video for a peer out of voice");
+        assert_eq!(cam_viewers(&a), 0);
+
+        push_raw(&b, ida, Msg::Voice(true));
+        let got = read_for(&mut r1, 3000).await;
+        assert!(got.starts_with(&[0, 0, 0, 1]) && got.len() > 10_000, "{} B", got.len());
+
+        // A second request replaces the first.
+        let (_s2, mut r2) = request(&conn).await;
+        let got = read_for(&mut r2, 3000).await;
+        assert!(got.len() > 10_000, "{} B", got.len());
+        let t = Instant::now();
+        while !matches!(tokio::time::timeout(Duration::from_secs(1), r1.read_chunk(1 << 20)).await, Ok(Ok(None) | Err(_))) {
+            assert!(t.elapsed() < Duration::from_secs(10), "old request still served");
+        }
+        wait_cam_viewers(&a, 1).await;
+
+        push_raw(&b, ida, Msg::Voice(false));
+        wait_cam_viewers(&a, 0).await;
+        read_for(&mut r2, 1000).await; // in flight
+        assert!(read_for(&mut r2, 3000).await.is_empty(), "video after Voice(false)");
+        push_raw(&b, ida, Msg::Voice(true));
+        let got = read_for(&mut r2, 3000).await;
+        // A fresh entry point: parameter sets (SPS, NAL type 7) first.
+        assert!(got.starts_with(&[0, 0, 0, 1]) && got[4] & 0x1f == 7, "{:?}", &got[..got.len().min(8)]);
+        a.leave();
+        b.leave();
+    }
+
+    /// (#43) A device change in a call restarts voice: views stay, and a
+    /// camera announced while voice is down starts once it is back.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn e2e_camera_device_change() {
+        let (a, _arx, b, brx, ida) = camera_pair().await;
+        b.join_voice();
+        wait_for(&brx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        wait_cam_frames(&b, ida, 10).await;
+        let view = |n: &Node| n.0.state.lock().unwrap().cam_views.get(&ida).map(|(s, _)| Arc::as_ptr(s));
+        let before = view(&b);
+        b.set_devices(crate::voice::Devices { input: Some("mic".into()), output: None });
+        wait_for(&brx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        assert_eq!(view(&b), before, "view restarted by a device change");
+        let n = cam_count(&b, ida);
+        wait_cam_frames(&b, ida, n + 20).await;
+
+        // Hold B in the restart window (voice down, start pending) while A
+        // turns its camera off and on, then let the restart finish.
+        {
+            let mut s = b.0.state.lock().unwrap();
+            s.voice = None;
+            s.voice_starting = true;
+        }
+        a.stop_camera();
+        wait_for(&brx, 10, |e| matches!(e, Event::PeerCamera { on: false, .. })).await;
+        a.start_camera(None);
+        wait_for(&brx, 60, |e| matches!(e, Event::PeerCamera { on: true, .. })).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!has_view(&b, ida), "received with voice down");
+        b.set_devices(crate::voice::Devices { input: Some("mic2".into()), output: None });
+        wait_for(&brx, 10, |e| matches!(e, Event::MyVoice(true))).await;
+        wait_cam_frames(&b, ida, 10).await;
+        a.leave();
+        b.leave();
+    }
+
+    /// Camera next to a screen stream: peers in voice (also late joiners)
+    /// decode it, those outside only learn it is on; the sender sees a
+    /// preview, leaving voice stops it.
     /// Run with: BIBICORD_FFMPEG=/path/to/ffmpeg cargo test e2e_camera -- --ignored
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
@@ -1704,6 +2122,9 @@ mod tests {
         let (c, crx) = node();
         c.join(&t, "Cyryl".into()).unwrap();
         wait_for(&crx, 30, |e| matches!(e, Event::PeerCamera { id, on: true } if *id == ida)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(c.camera_frames().is_empty(), "Cyryl is not in voice");
+        c.join_voice();
         wait_cam_frames(&c, ida, 10).await;
 
         a.leave_voice();

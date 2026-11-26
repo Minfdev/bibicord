@@ -73,9 +73,10 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
   zbierać opóźnienie.
 - **Kamera.** Działa jak na Discordzie: przycisk „Kamera” na kanale głosowym
   (obok „Ekran”) pokazuje obraz z kamerki w Twoim kafelku u wszystkich na
-  głosowym, bez klikania „Obejrzyj”. Ty widzisz podgląd (lustrzany). Kamera jest
-  niezależna od udostępniania ekranu (oba naraz), 720p30, kodowana sprzętowo,
-  wyłącza się po wyjściu z głosowego. Kamerę wybiera się w „Ustawieniach głosu”.
+  głosowym, bez klikania „Obejrzyj”; osoby spoza głosowego go nie dostają. Ty
+  widzisz podgląd (lustrzany). Kamera jest niezależna od udostępniania ekranu
+  (oba naraz), 720p30, kodowana sprzętowo, wyłącza się po wyjściu z głosowego.
+  Kamerę wybiera się w „Ustawieniach głosu”.
 - **Głos.** Opus 48 kHz z FEC, wysyłany w datagramach QUIC (bez retransmisji),
   z buforem jitter i miksowaniem.
   Mikrofon przechodzi przez redukcję szumów (RNNoise, wyłączalna), a czułość
