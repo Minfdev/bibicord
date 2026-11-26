@@ -32,9 +32,14 @@ scripts/installer-license.sh "$STAGE/license.txt"
 # ---- license page text
 L="$STAGE/license.txt"
 [ "$(head -c 3 "$L" | od -An -tx1 | tr -d ' \n')" = efbbbf ] || fail "license.txt bez BOM UTF-8"
-lines=$(wc -l < "$L")
-crlf=$(grep -c "$(printf '\r')\$" "$L" || true)
-[ "$lines" -gt 0 ] && [ "$crlf" -eq "$lines" ] || fail "license.txt: $crlf z $lines wierszy kończy się CRLF"
+# Byte-level check: grep in Git Bash does not see the CR before LF, so
+# count bytes instead. Every LF must follow a CR and no other CR may remain.
+lines=$(tr -cd '\n' < "$L" | wc -c | tr -d ' ')
+crs=$(tr -cd '\r' < "$L" | wc -c | tr -d ' ')
+rest=$(od -An -v -tx1 "$L" | tr -s ' \n' '  ' | sed 's/ 0d 0a//g')
+case "$rest" in *' 0d'* | *' 0a'*) bare=1 ;; *) bare=0 ;; esac
+[ "$lines" -gt 0 ] && [ "$crs" -eq "$lines" ] && [ "$bare" -eq 0 ] ||
+  fail "license.txt: $lines wierszy, $crs znaków CR, nie wszystkie końce to CRLF"
 grep -q 'bez żadnej gwarancji' "$L" || fail "brak polskiego podsumowania"
 n=$(tr -d '\r' < LICENSE | wc -l)
 tail -n "$n" "$L" | tr -d '\r' > "$STAGE/license-tail.txt"
