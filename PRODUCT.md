@@ -31,7 +31,8 @@ Jeden pokój na raz. Zaproszenie przesyła się poza aplikacją (np. komunikator
 ## Capabilities and Constraints
 
 - Pokój: nazwa, lista uczestników, kanał tekstowy `#czat`, jeden kanał głosowy.
-- Głos: wyciszenie, wyłączenie dźwięku, wskaźnik mówienia, wybór urządzeń.
+- Głos: wyciszenie, wyłączenie dźwięku, wskaźnik mówienia, wybór urządzeń,
+  aktywacja głosem albo „Naciśnij, aby mówić” z globalnym klawiszem.
 - Stream: wybór ekranu, rozdzielczość, FPS, bitrate, kodek; oglądanie jednego streamu na raz.
 - Bez historii czatu po wyjściu (brak serwera).
 - UI po polsku.

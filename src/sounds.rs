@@ -31,11 +31,14 @@ pub enum Cue {
     StreamStart,
     StreamStop,
     Message,
+    /// Push-to-talk key pressed / released.
+    PttOn,
+    PttOff,
 }
 
 impl Cue {
     #[cfg(test)]
-    pub const ALL: [Cue; 11] = [
+    pub const ALL: [Cue; 13] = [
         Cue::Connect,
         Cue::Disconnect,
         Cue::PeerJoin,
@@ -47,6 +50,8 @@ impl Cue {
         Cue::StreamStart,
         Cue::StreamStop,
         Cue::Message,
+        Cue::PttOn,
+        Cue::PttOff,
     ];
 }
 
@@ -98,6 +103,9 @@ fn score(cue: Cue) -> Score {
         ),
         Cue::StreamStop => s(vec![Note(0.0, B5, 0.8, 0.06), Note(0.06, GS5, 0.8, 0.06), Note(0.12, E5, 0.9, 0.15)], 0.05, 0.9),
         Cue::Message => s(vec![Note(0.0, D6, 1.0, 0.05), Note(0.045, G6, 0.55, 0.07)], 0.2, 0.7),
+        // Single quiet ticks: heard on every key press, so short and soft.
+        Cue::PttOn => s(vec![Note(0.0, G5, 1.0, 0.035)], 0.03, 0.45),
+        Cue::PttOff => s(vec![Note(0.0, D5, 1.0, 0.035)], 0.03, 0.4),
     }
 }
 
@@ -241,8 +249,30 @@ impl Player {
     pub fn play_forced(&self, cue: Cue, device: Option<String>) {
         let v = self.prefs.volume as f32 / 100.0;
         // Perceptual volume curve.
-        let gain = MAX_GAIN * v * v;
-        if let Some(tx) = &self.tx {
+        self.remote().play(cue, MAX_GAIN * v * v, device);
+    }
+
+    /// Current playback gain; 0 when cues are switched off.
+    pub fn gain(&self) -> f32 {
+        let v = self.prefs.volume as f32 / 100.0;
+        if self.prefs.enabled { MAX_GAIN * v * v } else { 0.0 }
+    }
+
+    /// Handle for playing cues from other threads (push-to-talk key).
+    pub fn remote(&self) -> Remote {
+        Remote(self.tx.clone())
+    }
+}
+
+/// Sends cues to the player thread; `gain` from `Player::gain`.
+#[derive(Clone)]
+pub struct Remote(Option<mpsc::Sender<PlayCmd>>);
+
+impl Remote {
+    pub fn play(&self, cue: Cue, gain: f32, device: Option<String>) {
+        if let Some(tx) = &self.0
+            && gain > 0.0
+        {
             let _ = tx.send(PlayCmd { cue, gain, device });
         }
     }
