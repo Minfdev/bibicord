@@ -19,6 +19,8 @@ const VIEWER_QUEUE: usize = 90;
 
 pub struct Hub {
     inner: Mutex<Inner>,
+    /// Set once by `close`; lets idle viewers (not subscribed) notice.
+    done: tokio::sync::watch::Sender<bool>,
 }
 
 struct Inner {
@@ -48,6 +50,7 @@ impl Hub {
                 viewers: Vec::new(),
                 closed: false,
             }),
+            done: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -79,6 +82,12 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;
         inner.viewers.clear();
+        self.done.send_replace(true);
+    }
+
+    /// Completes once the stream has ended (`close`).
+    pub async fn closed(&self) {
+        let _ = self.done.subscribe().wait_for(|d| *d).await;
     }
 
     /// A new encoder took over (the old one died): its bitstream starts from
@@ -309,6 +318,15 @@ mod tests {
             assert_eq!(cuts, vec![15 + 9 + 4, 15 + 9 + 105 + 55 + 15 + 9 + 4], "split {split}");
             assert_eq!(params, 4);
         }
+    }
+
+    #[tokio::test]
+    async fn closed_after_close() {
+        let hub = Hub::new(Codec::H264);
+        let t = tokio::time::timeout(std::time::Duration::from_millis(100), hub.closed()).await;
+        assert!(t.is_err(), "open hub reported closed");
+        hub.close();
+        hub.closed().await;
     }
 
     #[tokio::test]
