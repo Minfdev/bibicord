@@ -31,7 +31,9 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
   pola tekstowe, awatary z pierścieniem mówienia, odznaki NA ŻYWO, wiersze
   listy, menu, modale.
 * **Ekrany** – start, czat (wiadomości grupowane, pliki do 1 MB: spinacz lub
-  przeciągnięcie na okno, zapis przyciskiem „Zapisz”), scena głosowa z kafelkami
+  przeciągnięcie na okno, zapis przyciskiem „Zapisz”; historia mieści do 2000
+  pozycji i 64 MB, a po jej zapełnieniu najstarsze pliki stają się „już
+  niedostępne”, zanim zaczną znikać najstarsze wiadomości), scena głosowa z kafelkami
   16:9, oglądanie streamu z paskiem uczestników i czatem obok, okna
   „Udostępnij ekran”, „Zaproś” i „Ustawienia głosu”.
 
@@ -50,8 +52,11 @@ lewej, czat albo scena głosowa w środku, panel połączenia i własny profil
   Nie ma własnego serwera. Publiczne relaye n0 służą tylko do zestawienia
   połączenia, a gdy bezpośrednie połączenie jest niemożliwe, przenoszą
   zaszyfrowany ruch. Przy każdej osobie widać, czy łączysz się `P2P`, czy przez `relay`.
-- **Pokój = zaproszenie.** Tworzysz pokój, klikasz „zaproś”, a tekst
-  zaproszenia wysyłasz znajomym. Kto dołączy, sam połączy się z pozostałymi.
+- **Pokój = zaproszenie.** Tworzysz pokój, klikasz „Zaproś” i wysyłasz znajomym
+  link `bibicord://join/…`. Znajomy wkleja go na ekranie startowym i klika
+  „Dołącz”, a potem sam łączy się z pozostałymi. Link działa 24 godziny albo do
+  Twojego wyjścia z pokoju; „Nowy link” od razu unieważnia poprzedni. Każdy
+  uczestnik może zapraszać własnym linkiem.
 - **Stream w jakości źródła.** Ekran jest przechwytywany natywnie
   (Windows: Desktop Duplication; macOS: ScreenCaptureKit), kodowany
   **sprzętowo jeden raz** (NVENC / AMF / QuickSync / Media Foundation /
@@ -126,9 +131,11 @@ Oba skrypty wymagają `cargo-about` (`cargo install cargo-about --locked
 --features cli`): generuje licencje bibliotek do folderu `licenses`
 w instalatorze (`scripts/licenses.sh`).
 
-Workflow `.github/workflows/release.yml` buduje oba instalatory przy każdym
-pushu; tag `v*` publikuje je jako release na GitHubie (`BibiCord-Setup.exe`,
-`BibiCord.dmg`, `SHA256SUMS.txt`, `ffmpeg-source.tar`).
+Workflow `.github/workflows/release.yml` przy pushu na `main` i w PR-ach
+uruchamia tylko testy. Oba instalatory buduje dla tagu `v*`, który publikuje je
+jako release na GitHubie (`BibiCord-Setup.exe`, `BibiCord.dmg`,
+`SHA256SUMS.txt`, `ffmpeg-source.tar`), oraz przy ręcznym uruchomieniu
+(Actions → build → Run workflow), wtedy jako artefakty workflow.
 
 ### Wydanie nowej wersji
 
@@ -146,6 +153,9 @@ Kliknięcie pobiera instalator, sprawdza jego sumę SHA-256 z
 
 * Windows: `BibiCord-Setup.exe /S /RESTART` – cicha instalacja i restart.
 * macOS: nowa paczka `.app` z DMG zastępuje starą, aplikacja startuje ponownie.
+
+Gdy wydanie nie ma `SHA256SUMS.txt` albo poprawnej sumy instalatora (lub
+suma się nie zgadza), instalacja jest przerywana.
 
 `BIBICORD_NO_UPDATE=1` wyłącza sprawdzanie.
 
@@ -176,12 +186,33 @@ wszystkie dźwięki, a `BIBICORD_SOUNDS_OUT=<katalog> cargo test export_wavs -- 
 zapisuje je jako WAV.
 Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 
+## Bezpieczeństwo zaproszeń
+
+- Tożsamość urządzenia to losowy klucz w pliku `identity.key` w katalogu
+  danych aplikacji (na Unixie z prawami `0600`). Nie wynika z żadnego
+  zaproszenia, więc znajomość linku nie pozwala podszyć się pod jego autora.
+  `BIBICORD_EPHEMERAL_ID=1` (oraz uruchomienia demo) używa klucza tylko na
+  jedną sesję.
+- Link zawiera klucz publiczny zapraszającego (to jego adres) i losowy token
+  ważny 24 godziny. Token nie jest przesyłany: dołączający udowadnia, że go
+  zna, dowodem związanym z daną sesją TLS.
+- Każdy pokój ma losowy sekret, który nowy uczestnik dostaje po udanym
+  dołączeniu. Połączenia w siatce pokoju udowadniają znajomość sekretu.
+  Bez ważnego tokenu albo sekretu połączenie jest odrzucane, zanim padnie
+  jakakolwiek informacja o pokoju (nazwa, uczestnicy, awatary). Dowód jest
+  wzajemny: dzwoniący sprawdza też drugą stronę.
+- Po wyjściu z pokoju jego link i sekret przestają działać; nowy pokój ma nowe.
+  Sekretu nie da się dziś zmienić w trakcie trwania pokoju, więc były
+  uczestnik może wrócić do tego samego pokoju, dopóki on trwa.
+
 ## Struktura
 
 | Plik | Rola |
 |---|---|
 | `src/net.rs` | pokój P2P (siatka połączeń iroh), czat, sygnalizacja, przesyłanie wideo i głosu |
-| `src/proto.rs` | protokół i zaproszenia |
+| `src/proto.rs` | protokół, linki zaproszeń i dowody uwierzytelnienia |
+| `src/flow.rs` | limity kolejek i tempa: nikt w pokoju nie zapcha pamięci pozostałych |
+| `src/identity.rs` | stała tożsamość urządzenia (`identity.key`) |
 | `src/video/encode.rs` | przechwytywanie ekranu i wybór enkodera sprzętowego |
 | `src/video/hub.rs` | rozsyłanie strumienia do widzów (klatki kluczowe, wolni widzowie) |
 | `src/video/decode.rs` | dekodowanie sprzętowe do RGBA |
@@ -191,6 +222,7 @@ Skryptowane uruchomienia do zrzutów ekranu opisuje nagłówek `src/demo.rs`.
 | `src/ui/theme.rs` | tokeny design systemu i instalacja fontów |
 | `src/ui/widgets.rs` | komponenty |
 | `src/ui/{start,sidebar,chat,stage,dialogs}.rs` | ekrany i okna |
+| `src/ui/history.rs` | historia czatu i jej limity |
 | `src/demo.rs` | skryptowane uruchomienia (testy, zrzuty ekranu) |
 
 ## Licencje

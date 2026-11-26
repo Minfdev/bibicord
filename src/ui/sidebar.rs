@@ -107,7 +107,7 @@ impl App {
             invite = IconButton::new(ic::USER_PLUS, "Zaproś znajomych").show(ui).clicked();
         });
         if invite {
-            self.dialog = Some(Dialog::Invite);
+            self.open_invite();
         }
         ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, c::BG_BASE));
 
@@ -137,7 +137,7 @@ impl App {
                 }
             });
         match action {
-            Some(0) => self.dialog = Some(Dialog::Invite),
+            Some(0) => self.open_invite(),
             Some(1) => self.open_settings(),
             Some(2) => self.leave_room(&ui.ctx().clone()),
             Some(3) => self.dialog = Some(Dialog::Share),
@@ -229,7 +229,7 @@ impl App {
                         .show(ui)
                         .clicked()
                     {
-                        self.dialog = Some(Dialog::Invite);
+                        self.open_invite();
                     }
                 });
             });

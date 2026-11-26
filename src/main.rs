@@ -3,6 +3,8 @@
 mod avatar;
 mod demo;
 mod ffmpeg;
+mod flow;
+mod identity;
 mod mic;
 mod net;
 mod proto;

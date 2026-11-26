@@ -224,7 +224,11 @@ impl PeerAudio {
 
     fn decode(&mut self, data: &[u8], fec: bool) {
         let mut pcm = [0f32; FRAME * 6];
-        let n = match self.dec.decode_float(data, &mut pcm, fec) {
+        // For a lost frame (PLC, or FEC from the next packet) the buffer size
+        // is how much audio libopus makes up: exactly the one missing frame.
+        // A received packet decodes to its own length (up to 120 ms).
+        let len = if fec || data.is_empty() { FRAME } else { pcm.len() };
+        let n = match self.dec.decode_float(data, &mut pcm[..len], fec) {
             Ok(n) => n.min(FRAME),
             Err(_) => return,
         };
@@ -364,7 +368,7 @@ impl Voice {
     /// Starts capture + playback. Encoded packets (with sequence number
     /// prefix) are sent to `packets`.
     pub fn start(
-        packets: mpsc::UnboundedSender<Bytes>,
+        packets: mpsc::Sender<Bytes>,
         devices: Devices,
         muted: bool,
         deafened: bool,
@@ -406,6 +410,11 @@ impl Voice {
 
     pub fn set_muted(&self, m: bool) {
         self.shared.muted.store(m, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn is_muted(&self) -> bool {
+        self.shared.muted.load(Ordering::Relaxed)
     }
 
     pub fn set_deafened(&self, d: bool) {
@@ -591,14 +600,28 @@ pub fn list_devices() -> (Vec<DeviceInfo>, Vec<DeviceInfo>) {
     (ins, outs)
 }
 
+/// Unit tests never touch real devices (and don't need the env var).
 fn fake_audio() -> bool {
-    std::env::var_os("BIBICORD_FAKE_AUDIO").is_some()
+    cfg!(test) || std::env::var_os("BIBICORD_FAKE_AUDIO").is_some()
+}
+
+/// Encoded packets waiting to go out: about 1 s of audio.
+pub const PACKET_QUEUE: usize = 64;
+
+pub fn packet_channel() -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+    mpsc::channel(PACKET_QUEUE)
+}
+
+/// Never blocks the audio callback: when the network side falls behind,
+/// the packet is dropped (late voice is useless anyway).
+fn send_packet(packets: &mpsc::Sender<Bytes>, pkt: Bytes) {
+    let _ = packets.try_send(pkt);
 }
 
 /// Encoder side: takes mono samples at `in_rate`, sends Opus packets.
 fn capture_pipeline(
     shared: Arc<Shared>,
-    packets: mpsc::UnboundedSender<Bytes>,
+    packets: mpsc::Sender<Bytes>,
     in_rate: u32,
 ) -> Result<impl FnMut(&[f32]) + Send + 'static> {
     let mut enc = opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip)?;
@@ -686,9 +709,9 @@ fn capture_pipeline(
             for p in preroll.drain(..) {
                 let mut p = p.to_vec();
                 p[2] |= FLAG_PREROLL;
-                let _ = packets.send(Bytes::from(p));
+                send_packet(&packets, Bytes::from(p));
             }
-            let _ = packets.send(pkt);
+            send_packet(&packets, pkt);
         }
     })
 }
@@ -714,7 +737,7 @@ fn mixer(shared: Arc<Shared>, out_rate: u32) -> impl FnMut(usize) -> Vec<f32> + 
 
 /// Test mode without audio devices. With `BIBICORD_FAKE_TONE` the
 /// "microphone" plays a tone that alternates between speech and silence.
-fn run_fake(shared: Arc<Shared>, packets: mpsc::UnboundedSender<Bytes>, stop: Arc<AtomicBool>) {
+fn run_fake(shared: Arc<Shared>, packets: mpsc::Sender<Bytes>, stop: Arc<AtomicBool>) {
     let Ok(mut capture) = capture_pipeline(shared.clone(), packets, RATE) else { return };
     let mut mix = mixer(shared, RATE);
     let tone = std::env::var_os("BIBICORD_FAKE_TONE").is_some();
@@ -752,7 +775,7 @@ fn find_device(host: &cpal::Host, id: Option<&str>, input: bool) -> Option<cpal:
 
 fn run_audio(
     shared: Arc<Shared>,
-    packets: mpsc::UnboundedSender<Bytes>,
+    packets: mpsc::Sender<Bytes>,
     devices: &Devices,
 ) -> Result<(cpal::Stream, cpal::Stream)> {
     let host = cpal::default_host();
@@ -918,7 +941,7 @@ pub(crate) mod sim {
     pub fn run(net: &Net, secs: f64) -> Report {
         // Network simulation: the synthetic tone is not run through RNNoise.
         let shared = |_| Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, ..Prefs::default() }));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = packet_channel();
         let mut capture = capture_pipeline(shared(0), tx, RATE).unwrap();
         let rx_voice = Voice { shared: shared(1), stop: Arc::new(AtomicBool::new(false)) };
         let mut mix = mixer(rx_voice.shared.clone(), RATE);
@@ -1070,6 +1093,104 @@ pub(crate) mod sim {
 mod tests {
     use super::*;
 
+    /// 40 frames (0.8 s) of a voiced sound with rising pitch, encoded as in
+    /// `capture_pipeline`; PLC (which repeats the past) can't fake it.
+    fn glide_packets() -> Vec<Vec<u8>> {
+        let mut enc = opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        enc.set_bitrate(opus::Bitrate::Bits(48_000)).unwrap();
+        enc.set_inband_fec(true).unwrap();
+        enc.set_packet_loss_perc(10).unwrap();
+        let mut phase = 0f32;
+        (0..40)
+            .map(|k| {
+                let frame: Vec<f32> = (0..FRAME)
+                    .map(|i| {
+                        let t = (k * FRAME + i) as f32 / RATE as f32;
+                        phase += 2.0 * std::f32::consts::PI * (150.0 + 500.0 * t) / RATE as f32;
+                        0.3 * (phase.sin() + 0.5 * (2.0 * phase).sin() + 0.25 * (3.0 * phase).sin()) / 1.75
+                    })
+                    .collect();
+                let mut out = [0u8; 1500];
+                let n = enc.encode_float(&frame, &mut out).unwrap();
+                out[..n].to_vec()
+            })
+            .collect()
+    }
+
+    /// Plays `pkts` through the receive path in real time (one packet in,
+    /// 20 ms out) with a jitter buffer `depth` frames deep. `lost` never
+    /// arrive, `early` arrive one tick early. Returns 20 ms output windows,
+    /// frame `k` of the stream in window `k`.
+    fn play(pkts: &[Vec<u8>], lost: &[usize], early: &[usize], depth: u64) -> (Vec<Vec<f32>>, PeerStats) {
+        let mut p = PeerAudio::new(RATE).unwrap();
+        p.depth = depth;
+        let mut out = Vec::new();
+        for k in 0..pkts.len() {
+            for j in [k, k + 1] {
+                if j < pkts.len() && !lost.contains(&j) && early.contains(&j) == (j > k) {
+                    p.insert(j as u16, FLAG_SPEAKING, &pkts[j]);
+                }
+            }
+            let mut w = vec![0f32; FRAME];
+            p.mix_into(&mut w);
+            out.push(w);
+        }
+        // Drift correction never kicked in, so samples passed through the
+        // resampler unshifted and windows of different runs line up.
+        assert!(p.resample.step == 1.0 && p.resample.t == 0.0);
+        out.drain(..depth as usize - 1); // playback starts once `depth` frames are in
+        (out, p.stats)
+    }
+
+    fn err(a: &[f32], b: &[f32]) -> f32 {
+        rms(&a.iter().zip(b).map(|(x, y)| x - y).collect::<Vec<_>>())
+    }
+
+    /// A lost packet is rebuilt from the next one's FEC: both that frame and
+    /// the next sound like the lossless stream.
+    #[test]
+    fn lost_frame_recovered_by_fec() {
+        let pkts = glide_packets();
+        let (truth, _) = play(&pkts, &[], &[], START_DEPTH);
+        let (got, stats) = play(&pkts, &[20], &[], START_DEPTH);
+        assert_eq!((stats.fec, stats.concealed), (1, 0));
+        // Frame RMS is ~0.14; a 120 ms request was off by ~0.12 / ~0.05.
+        for k in [20, 21] {
+            let e = err(&got[k], &truth[k]);
+            assert!(e < 0.02, "frame {k}: {e}");
+        }
+        for k in (0..20).chain(22..got.len()) {
+            assert!(err(&got[k], &truth[k]) < 0.005, "frame {k}");
+        }
+    }
+
+    /// Concealment asks libopus for exactly the missing 20 ms, in both the
+    /// "lost" and the underrun path: output matches a plain decoder doing so.
+    #[test]
+    fn lost_frame_concealed_one_frame() {
+        let pkts = glide_packets();
+        // (lost, early, depth): 20 concealed (next one missing too), 21 from
+        // FEC; then 20 concealed as an underrun.
+        for (lost, early, depth) in [(&[20, 21][..], &[22][..], START_DEPTH), (&[20][..], &[][..], 1)] {
+            let (got, stats) = play(&pkts, lost, early, depth);
+            assert_eq!(stats.concealed, 1, "{lost:?}");
+            let mut dec = opus::Decoder::new(RATE, opus::Channels::Mono).unwrap();
+            for (k, w) in got.iter().enumerate() {
+                let mut pcm = [0f32; FRAME];
+                let (data, fec): (&[u8], bool) = match (lost.contains(&k), lost.contains(&(k + 1))) {
+                    (false, _) => (&pkts[k], false),
+                    (true, false) if k + 1 < pkts.len() && stats.fec > 0 => (&pkts[k + 1], true),
+                    (true, _) => (&[], false),
+                };
+                assert_eq!(dec.decode_float(data, &mut pcm, fec).unwrap(), FRAME);
+                // Same libopus and inputs on both sides, so equal; a 120 ms
+                // request threw the frame after the gap off by ~0.04-0.09.
+                let e = err(w, &pcm);
+                assert!(e < 1e-3, "{lost:?} frame {k}: {e}");
+            }
+        }
+    }
+
     #[test]
     fn prefs_roundtrip() {
         assert_eq!(Prefs::parse(""), Prefs::default());
@@ -1099,7 +1220,7 @@ mod tests {
         let mut sh = Shared::new(false, false, prefs);
         sh.ptt_held = held;
         let shared = Arc::new(sh);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        let (tx, mut rx) = packet_channel();
         let mut capture = capture_pipeline(shared.clone(), tx, RATE).unwrap();
         script
             .iter()
@@ -1172,7 +1293,7 @@ mod tests {
         let mut sh = Shared::new(false, false, Prefs { mode: Mode::Voice, ..ptt_prefs(0) });
         sh.ptt_held = held;
         let shared = Arc::new(sh);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        let (tx, mut rx) = packet_channel();
         let mut capture = capture_pipeline(shared.clone(), tx, RATE).unwrap();
         // Silence under voice activation fills the pre-roll, nothing is sent.
         for _ in 0..5 {
@@ -1205,7 +1326,7 @@ mod tests {
                 false,
                 Prefs { noise_suppression: false, sensitivity: Some(threshold), ..Prefs::default() },
             ));
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = packet_channel();
             let mut capture = capture_pipeline(shared.clone(), tx, RATE).unwrap();
             for k in 0..50 {
                 let frame: Vec<f32> = (0..FRAME)
@@ -1219,6 +1340,27 @@ mod tests {
         };
         assert!(sent(-40) >= 49);
         assert_eq!(sent(-20), 0);
+    }
+
+    /// Nobody takes the packets (stalled network task): capture keeps
+    /// running without blocking, and only `PACKET_QUEUE` packets are held.
+    #[test]
+    fn full_packet_queue_drops() {
+        let (tx, mut rx) = packet_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let shared = Arc::new(Shared::new(false, false, Prefs { noise_suppression: false, sensitivity: Some(-40), ..Prefs::default() }));
+            let mut capture = capture_pipeline(shared, tx.clone(), RATE).unwrap();
+            for k in 0..PACKET_QUEUE * 4 {
+                let frame: Vec<f32> = (0..FRAME)
+                    .map(|i| 0.0447 * ((k * FRAME + i) as f32 / RATE as f32 * 2.0 * std::f32::consts::PI * 220.0).sin())
+                    .collect();
+                capture(&frame);
+            }
+            let _ = done_tx.send(tx);
+        });
+        let _tx = done_rx.recv_timeout(Duration::from_secs(10)).expect("capture blocked or panicked");
+        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).count(), PACKET_QUEUE);
     }
 
     #[test]
